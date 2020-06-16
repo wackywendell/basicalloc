@@ -6,8 +6,10 @@ use core::ptr::null_mut;
 
 use log::debug;
 
+const HEADER_SIZE: usize = 16; // size_of::<MemoryHeader>();
+
 #[derive(Clone)]
-#[repr(C)]
+#[repr(C, align(16))]
 struct MemoryHeader {
     next: *mut MemoryHeader,
     size: usize,
@@ -38,8 +40,6 @@ impl MemoryHeader {
         self.next.as_mut()
     }
 }
-
-const HEADER_SIZE: usize = 8; // size_of::<MemoryHeader>();
 
 struct BlockList {
     first: *mut MemoryHeader,
@@ -235,9 +235,9 @@ mod tests {
         const BLOCKS: usize = 3;
 
         let layouts: [Layout; BLOCKS] = [
-            Layout::from_size_align(32, 8).unwrap(),
-            Layout::from_size_align(32, 8).unwrap(),
-            Layout::from_size_align(80, 8).unwrap(),
+            Layout::from_size_align(64, 16).unwrap(),
+            Layout::from_size_align(64, 16).unwrap(),
+            Layout::from_size_align(224, 16).unwrap(),
         ];
 
         let pointers: [*mut u8; BLOCKS] = unsafe {
@@ -286,28 +286,28 @@ mod tests {
             assert!(first.next.is_null());
         };
 
-        // The block list now has 1 32-byte block on it
+        // The block list now has 1 64-byte block on it
 
         ////////////////////////////////////////////////////////////
         // Allocation with a block list
         unsafe {
-            // Allocate 40 bytes, more than fits in the block on the block list
-            let newp = allocator.alloc(Layout::from_size_align(40, 8).unwrap());
+            // Allocate 112 bytes, more than fits in the block on the block list
+            let newp = allocator.alloc(Layout::from_size_align(112, 16).unwrap());
             assert_eq!(newp, pointers[2].add(layouts[2].size()));
 
-            // Allocate 16 bytes, which should fit in the block
-            let p16 = allocator.alloc(Layout::from_size_align(16, 8).unwrap());
+            // Allocate 32 bytes, which should fit in the block
+            let p32 = allocator.alloc(Layout::from_size_align(32, 16).unwrap());
             // The algorithm returns the second half of the block
-            assert_eq!(p16, pointers[1].add(16));
+            assert_eq!(p32, pointers[1].add(32));
 
-            // We should now still have 16 bytes in 1 block in the block list
+            // We should now still have 32 bytes in 1 block in the block list
 
-            // Allocate 8 bytes and another 8 bytes, which should both fit in the block
-            let p8a = allocator.alloc(Layout::from_size_align(8, 8).unwrap());
-            let p8b = allocator.alloc(Layout::from_size_align(8, 8).unwrap());
+            // Allocate 16 bytes and another 16 bytes, which should both fit in the block
+            let p16a = allocator.alloc(Layout::from_size_align(16, 16).unwrap());
+            let p16b = allocator.alloc(Layout::from_size_align(16, 16).unwrap());
             // The algorithm returns the second half of the block
-            assert_eq!(p8a, pointers[1].add(8));
-            assert_eq!(p8b, pointers[1].add(8));
+            assert_eq!(p16a, pointers[1].add(16));
+            assert_eq!(p16b, pointers[1]);
 
             // And now our block list should be empty
             let blocks = allocator
