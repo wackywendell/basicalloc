@@ -7,6 +7,9 @@ use core::ptr::null_mut;
 use log::debug;
 use static_assertions::const_assert;
 
+// We use C representation and align to 16 bytes for... simplicity. This is
+// perhaps a stronger constraint that we need, but it does make things simple
+// and straightforward.
 #[derive(Clone)]
 #[repr(C, align(16))]
 struct MemoryHeader {
@@ -15,7 +18,9 @@ struct MemoryHeader {
 }
 
 // We will align to 16 bytes and our headers will be given that much space
-const HEADER_SIZE: usize = 16; // size_of::<MemoryHeader>();
+// Similarly, all blocks will be at least 16 bytes large, even if they aren't
+// aware of it.
+const HEADER_SIZE: usize = 16;
 const_assert!(HEADER_SIZE <= core::mem::size_of::<MemoryHeader>());
 
 impl MemoryHeader {
@@ -151,9 +156,9 @@ impl<G: HeapGrower> BasicAlloc<G> {
     }
 
     fn aligned_size(layout: Layout) -> usize {
-        // We align everything to 64 bytes.
+        // We align everything to 16 bytes, and all blocks are at least 16 bytes.
         // Its pretty wasteful, but easy!
-        let layout = layout.align_to(8).expect("Whoa, serious memory issues");
+        let layout = layout.align_to(16).expect("Whoa, serious memory issues");
         layout.pad_to_align().size() as usize
     }
 }
