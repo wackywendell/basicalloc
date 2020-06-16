@@ -5,8 +5,7 @@ use core::cell::UnsafeCell;
 use core::ptr::null_mut;
 
 use log::debug;
-
-const HEADER_SIZE: usize = 16; // size_of::<MemoryHeader>();
+use static_assertions::const_assert;
 
 #[derive(Clone)]
 #[repr(C, align(16))]
@@ -14,6 +13,10 @@ struct MemoryHeader {
     next: *mut MemoryHeader,
     size: usize,
 }
+
+// We will align to 16 bytes and our headers will be given that much space
+const HEADER_SIZE: usize = 16; // size_of::<MemoryHeader>();
+const_assert!(HEADER_SIZE <= core::mem::size_of::<MemoryHeader>());
 
 impl MemoryHeader {
     #[allow(clippy::cast_ptr_alignment)]
