@@ -2,8 +2,7 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
-use core::marker::PhantomData;
-use core::mem::size_of;
+// use core::mem::size_of;
 use core::ptr::null_mut;
 
 #[derive(Clone)]
@@ -34,7 +33,7 @@ impl MemoryHeader {
     }
 }
 
-const HEADER_SIZE: usize = size_of::<MemoryHeader>();
+const HEADER_SIZE: usize = 8; // size_of::<MemoryHeader>();
 
 struct BlockList {
     first: *mut MemoryHeader,
@@ -88,34 +87,42 @@ impl BlockList {
 }
 
 trait HeapGrower {
-    unsafe fn grow_heap(size: usize) -> *mut u8;
+    unsafe fn grow_heap(&mut self, size: usize) -> *mut u8;
 }
 
 struct UnixHeapGrower;
 
 impl HeapGrower for UnixHeapGrower {
-    unsafe fn grow_heap(size: usize) -> *mut u8 {
+    unsafe fn grow_heap(&mut self, size: usize) -> *mut u8 {
         libc::sbrk(size as i32) as *mut u8
     }
 }
 
 struct BasicAlloc<G: HeapGrower> {
-    grower: PhantomData<G>,
+    grower: UnsafeCell<G>,
     blocks: UnsafeCell<BlockList>,
 }
 
-impl<G: HeapGrower> Default for BasicAlloc<G> {
+impl<G: HeapGrower + Default> Default for BasicAlloc<G> {
     fn default() -> Self {
         BasicAlloc {
-            grower: PhantomData,
+            grower: UnsafeCell::from(G::default()),
             blocks: UnsafeCell::from(BlockList::default()),
         }
     }
 }
 
 impl<G: HeapGrower> BasicAlloc<G> {
-    unsafe fn new_block(size: usize) -> *mut u8 {
-        G::grow_heap(size)
+    fn new(grower: G) -> Self {
+        BasicAlloc {
+            grower: UnsafeCell::from(grower),
+            blocks: UnsafeCell::from(BlockList::default()),
+        }
+    }
+
+    unsafe fn new_block(&self, size: usize) -> *mut u8 {
+        let grower = self.grower.get().as_mut().unwrap();
+        grower.grow_heap(size)
     }
 
     fn aligned_size(layout: Layout) -> usize {
@@ -132,14 +139,14 @@ unsafe impl<G: HeapGrower> GlobalAlloc for BasicAlloc<G> {
 
         let blocks_ptr = self.blocks.get();
         let blocks = match blocks_ptr.as_mut() {
-            None => return BasicAlloc::<G>::new_block(needed_size),
+            None => return self.new_block(needed_size),
             Some(b) => b,
         };
 
         if let Some(ptr) = blocks.pop_size(needed_size) {
             return ptr;
         }
-        BasicAlloc::<G>::new_block(needed_size)
+        self.new_block(needed_size)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -167,10 +174,52 @@ unsafe impl GlobalAlloc for BasicUnixAlloc {
     }
 }
 
+pub struct ToyHeap {
+    size: usize,
+    heap: [u8; 1024],
+}
+
+impl Default for ToyHeap {
+    fn default() -> Self {
+        ToyHeap {
+            size: 0,
+            heap: [0; 1024],
+        }
+    }
+}
+
+impl HeapGrower for ToyHeap {
+    unsafe fn grow_heap(&mut self, size: usize) -> *mut u8 {
+        if self.size + size > self.heap.len() {
+            panic!("Out of memory in this little toy heap!");
+        }
+        let ptr = self.heap.as_mut_ptr().add(self.size);
+        self.size += size;
+        ptr
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn it_works() {
-        assert_eq!(2 + 2, 4);
+        let toy_heap = ToyHeap::default();
+        let allocator = BasicAlloc::new(toy_heap);
+
+        unsafe {
+            allocator.alloc(Layout::from_size_align(8, 8).unwrap());
+        }
+
+        let toy_heap = unsafe {
+            allocator
+                .grower
+                .get()
+                .as_mut()
+                .expect("There should be a heap here")
+        };
+
+        assert_eq!(toy_heap.size, 16);
     }
 }
