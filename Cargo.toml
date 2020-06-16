@@ -8,3 +8,9 @@ edition = "2018"
 
 [dependencies]
 libc = "0.2"
+log = "0.4"
+
+[dev-dependencies]
+# pretty_env_logger = "0.3"
+env_logger = "*"
+test-env-log = "0.2"
