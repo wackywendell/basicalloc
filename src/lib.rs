@@ -310,12 +310,13 @@ mod tests {
 
             // We should now still have 32 bytes in 1 block in the block list
 
-            // Allocate 16 bytes and another 16 bytes, which should both fit in the block
-            let p16a = allocator.alloc(Layout::from_size_align(16, 16).unwrap());
-            let p16b = allocator.alloc(Layout::from_size_align(16, 16).unwrap());
+            // Allocate 8 bytes and another 16 bytes, which should both fit in the block
+            // and completely consume it - because the 8 bytes should expand to 16
+            let p8 = allocator.alloc(Layout::from_size_align(16, 4).unwrap());
+            let p16 = allocator.alloc(Layout::from_size_align(8, 1).unwrap());
             // The algorithm returns the second half of the block
-            assert_eq!(p16a, pointers[1].add(16));
-            assert_eq!(p16b, pointers[1]);
+            assert_eq!(p8, pointers[1].add(16));
+            assert_eq!(p16, pointers[1]);
 
             // And now our block list should be empty
             let blocks = allocator
