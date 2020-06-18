@@ -1,5 +1,7 @@
 #![no_std]
 
+//! A basic memory allocator.
+
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::fmt;
@@ -9,10 +11,15 @@ use core::ptr::null_mut;
 use log::debug;
 use static_assertions::const_assert;
 
+// The header for our free blocks.
+//
+// The header includes a pointer to the next free block, and the size of the
+// current block (including the header).
+//
 // We use C representation and align to 16 bytes for... simplicity. This is
 // perhaps a stronger constraint that we need, but it does make things simple
 // and straightforward.
-#[derive(Clone)]
+#[derive(Copy, Clone)]
 #[repr(C, align(16))]
 struct FreeHeader {
     next: *mut FreeHeader,
@@ -28,6 +35,7 @@ struct FreeHeader {
 const HEADER_SIZE: usize = 16;
 const_assert!(HEADER_SIZE <= core::mem::size_of::<FreeHeader>());
 
+// An enum for easy comparison of blocks and their order
 enum Relation {
     Before,
     AdjacentBefore,
@@ -50,6 +58,7 @@ impl FreeHeader {
 // - header should never be a null pointer
 // - header.next should be null or point to a valid MemoryBlock
 // - Any safe functions should preserve LinkedLists
+#[derive(Copy, Clone)]
 struct FreeBlock {
     header: *mut FreeHeader,
 }
@@ -62,12 +71,6 @@ impl FreeBlock {
         let next_ptr = next.map(|b| b.header).unwrap_or(null_mut());
         let header = unsafe { FreeHeader::from_raw(ptr, next_ptr, size) };
         FreeBlock { header }
-    }
-
-    unsafe fn clone(&self) -> Self {
-        FreeBlock {
-            header: self.header,
-        }
     }
 
     fn _as_slice(&self) -> &[u8] {
@@ -122,6 +125,10 @@ impl FreeBlock {
         }
     }
 
+    // Get a mutable view of the header.
+    //
+    // This method is unsafe because it allows modifying the size or pointer of
+    // a free block in safe code, which could lead to corruption.
     unsafe fn header_mut(&mut self) -> &mut FreeHeader {
         self.header
             .as_mut()
@@ -156,7 +163,7 @@ impl FreeBlock {
 
         let (merges, mut try_next) = if end == ptr {
             self.header_mut().size += size;
-            (1, self.clone())
+            (1, *self)
         } else {
             self.insert(ptr, size);
             (0, self.next().unwrap())
@@ -238,7 +245,7 @@ impl Default for BlockList {
 impl fmt::Display for BlockList {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "BlockList(")?;
-        let mut next = unsafe { self.first.as_ref().map(|b| b.clone()) };
+        let mut next = self.first;
         let mut start = true;
         while let Some(ref block) = next {
             if !start {
@@ -260,8 +267,7 @@ impl BlockList {
     fn pop_size(&mut self, size: usize) -> Option<*mut u8> {
         debug!("pop_size({})", size);
 
-        let mut first: FreeBlock = self.first.take()?;
-
+        let mut first = self.first?;
         debug!("  pop_size got first");
         if first.size() == size {
             debug!("  First block at {:?} is big enough", first.header);
@@ -272,12 +278,10 @@ impl BlockList {
                 "  Split off from first block at {:?} to {:?}",
                 first.header, split,
             );
-            self.first = Some(first);
             return Some(split);
         }
 
-        let mut parent = unsafe { first.clone() };
-        self.first = Some(first);
+        let mut parent = first;
         loop {
             let mut next = parent.next()?;
             debug!("  Checking block at {:?} Size {}", next.header, next.size());
@@ -309,7 +313,7 @@ impl BlockList {
                 self.first = Some(new_block);
                 return;
             }
-            Some(ref p) => p.clone(),
+            Some(p) => p,
         };
 
         match new_block.relation(&parent) {
@@ -358,7 +362,7 @@ impl BlockList {
     pub fn len(&self) -> usize {
         let mut parent = match self.first {
             None => return 0,
-            Some(ref p) => unsafe { p.clone() },
+            Some(p) => p,
         };
 
         let mut length = 1;
