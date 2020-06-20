@@ -232,6 +232,14 @@ impl FreeBlock {
     }
 }
 
+// A BlockList is a linked list of "free" blocks.
+//
+// It maintains a few invariants:
+//
+// - Each block should link to the next, with the last one linking to null.
+// - Each block should have a pointer < next.
+// - No two blocks should be precisely adjacent (those should be automatically
+//   merged on insertion).
 struct BlockList {
     first: Option<FreeBlock>,
 }
@@ -270,7 +278,92 @@ impl fmt::Display for BlockList {
     }
 }
 
+#[derive(Default)]
+pub struct Validity {
+    // Number of blocks overlapping other blocks.
+    //
+    // This likely indicates corruption.
+    //
+    // If there are also out of order blocks, this might undercount.
+    pub overlaps: usize,
+
+    // Number of blocks that are directly adjacent to each other, and not
+    // merged. This shouldn't happen, but isn't totally corrupt.
+    pub adjacents: usize,
+    // Number of blocks that do not have an address less than their next.
+    //
+    // This shouldn't occur.
+    pub out_of_orders: usize,
+}
+
+impl Validity {
+    pub fn is_valid(&self) -> bool {
+        self.overlaps == 0 && self.adjacents == 0 && self.out_of_orders == 0
+    }
+}
+
+impl From<Validity> for bool {
+    fn from(v: Validity) -> bool {
+        v.is_valid()
+    }
+}
+
+#[derive(Default)]
+pub struct Stats {
+    pub length: usize,
+    pub size: usize,
+}
+
 impl BlockList {
+    // Check current size of the list, and whether its valid.
+    pub fn stats(&self) -> (Validity, Stats) {
+        let mut previous = match self.first {
+            None => {
+                // No blocks, no stats
+                return Default::default();
+            }
+            Some(p) => p,
+        };
+
+        let mut validity: Validity = Default::default();
+
+        let mut stats = Stats {
+            length: 1,
+            size: previous.size(),
+        };
+
+        while let Some(next) = previous.next() {
+            match previous.relation(&next) {
+                Relation::Before => {
+                    // This is valid, do nothing.
+                }
+                Relation::AdjacentBefore => {
+                    // Right order, but these should be merged.
+                    validity.adjacents += 1;
+                }
+                Relation::Overlapping => {
+                    // This is really bad.
+                    validity.overlaps += 1;
+                }
+                Relation::AdjacentAfter => {
+                    // Wrong order, and these should be merged.
+                    validity.out_of_orders += 1;
+                    validity.adjacents += 1;
+                }
+                Relation::After => {
+                    // Wrong order.
+                    validity.out_of_orders += 1;
+                }
+            }
+
+            stats.length += 1;
+            stats.size += next.size();
+            previous = next;
+        }
+
+        (validity, stats)
+    }
+
     // Find and remove a chunk of size 'size' from the linked list
     fn pop_size(&mut self, size: usize) -> Option<*mut u8> {
         // debug!("pop_size({})", size);
@@ -482,6 +575,10 @@ impl<G: HeapGrower> RawAlloc<G> {
         }
     }
 
+    pub fn stats(&self) -> (Validity, Stats) {
+        self.blocks.stats()
+    }
+
     fn aligned_size(layout: Layout) -> usize {
         // We align everything to 16 bytes, and all blocks are at least 16 bytes.
         // Its pretty wasteful, but easy!
@@ -585,6 +682,10 @@ impl<G: HeapGrower + Default> BasicAlloc<G> {
 
         ptr.lock()
     }
+
+    pub fn stats(&self) -> (Validity, Stats) {
+        self.get_raw().stats()
+    }
 }
 
 #[derive(Default)]
@@ -597,6 +698,10 @@ impl BasicUnixAlloc {
         BasicUnixAlloc {
             alloc: BasicAlloc::new(),
         }
+    }
+
+    pub fn stats(&self) -> (Validity, Stats) {
+        self.alloc.stats()
     }
 }
 
@@ -664,6 +769,8 @@ mod tests {
             let mut pointers = [null_mut(); BLOCKS];
             for (i, &l) in layouts.iter().enumerate() {
                 pointers[i] = allocator.alloc(l);
+                let (validity, _stats) = allocator.stats();
+                assert!(validity.is_valid());
             }
             pointers
         };
@@ -688,6 +795,8 @@ mod tests {
 
         // Deallocate the second pointer
         unsafe { allocator.dealloc(pointers[1], layouts[1]) };
+        let (validity, _stats) = allocator.stats();
+        assert!(validity.is_valid());
 
         // Check that the block list is as expected
         assert!(allocator.blocks.first.is_some());
@@ -711,6 +820,8 @@ mod tests {
         unsafe {
             // Allocate 112 bytes, more than fits in the block on the block list
             let newp = allocator.alloc(Layout::from_size_align(112, 16).unwrap());
+            let (validity, _stats) = allocator.stats();
+            assert!(validity.is_valid());
             assert_eq!(
                 newp,
                 pointers[2].add(round_up(layouts[2].size(), page_size))
@@ -719,6 +830,8 @@ mod tests {
 
             // Allocate 32 bytes, which should fit in the block
             let p32 = allocator.alloc(Layout::from_size_align(32, 16).unwrap());
+            let (validity, _stats) = allocator.stats();
+            assert!(validity.is_valid());
             // The algorithm returns the second half of the block
             assert_eq!(p32, pointers[1].add(32));
 
@@ -728,8 +841,12 @@ mod tests {
             // and completely consume it - because the 8 bytes should expand to 16
             log::info!("p32: {}", allocator.blocks);
             let p8 = allocator.alloc(Layout::from_size_align(16, 4).unwrap());
+            let (validity, _stats) = allocator.stats();
+            assert!(validity.is_valid());
             log::info!("p8: {}", allocator.blocks);
             let p16 = allocator.alloc(Layout::from_size_align(8, 1).unwrap());
+            let (validity, _stats) = allocator.stats();
+            assert!(validity.is_valid());
             // The algorithm returns the second half of the block
             log::info!("p16: {}", allocator.blocks);
             assert_eq!(p8, pointers[1].add(16));
