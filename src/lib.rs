@@ -149,6 +149,8 @@ impl FreeBlock {
         }
 
         let block = FreeBlock { header: next };
+        // Update this block to look to next's next, cutting next out of the chain
+        header.next = block.header_view().next;
 
         (block.header as *mut u8, block.size())
     }
@@ -386,11 +388,11 @@ impl BlockList {
         let mut parent = first;
         loop {
             let mut next = parent.next()?;
-            // debug!("  Checking block at {:?} Size {}", next.header, next.size());
+            // log::trace!("  Checking block at {:?} Size {}", next.header, next.size());
 
             if next.size() == size {
                 let (ptr, _) = parent.pop_next();
-                // debug!("  Found correctly sized block at {:?}", ptr);
+                // log::trace!("  Found correctly sized block at {:?}", ptr);
                 return Some(ptr);
             }
 
@@ -401,7 +403,7 @@ impl BlockList {
             }
 
             // This block is bigger than we need, split it
-            // debug!("  Found big block at {:?}", next.header);
+            // log::trace!("  Found big block at {:?}", next.header);
             return Some(next.split(size));
         }
     }
@@ -434,6 +436,7 @@ impl BlockList {
                 // merge the two into a single block
                 new_block.header_mut().next = previous.header;
                 let merged = new_block.try_merge_next();
+                self.first = Some(new_block);
                 assert!(merged, "They were adjacent, they should merge");
                 return;
             }
@@ -618,6 +621,15 @@ impl<G: HeapGrower> RawAlloc<G> {
             .align_to(16)
             .expect("Whoa, serious memory issues")
             .pad_to_align();
+
+        // log::trace!(
+        //     "Alignment: {}@{} -> {}@{}",
+        //     layout.size(),
+        //     layout.align(),
+        //     aligned_layout.size(),
+        //     aligned_layout.align()
+        // );
+
         aligned_layout.size()
     }
 
@@ -631,23 +643,30 @@ impl<G: HeapGrower> RawAlloc<G> {
     /// This is very unsafe. See GlobalAlloc for details.
     pub unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
         let needed_size = RawAlloc::<G>::block_size(layout);
-        // debug!("Allocating {} bytes", needed_size);
+        // log::trace!("Allocating {} bytes", needed_size);
 
         if let Some(ptr) = self.blocks.pop_size(needed_size) {
+            // log::trace!("Popped off a block of size {} at {:?}", needed_size, ptr);
             return ptr;
         }
 
         let (ptr, size) = self.grower.grow_heap(needed_size);
+        // log::trace!("Grew to size {}", needed_size);
+
         if size == needed_size {
+            // log::trace!("    exactly as needed");
             return ptr;
         }
 
         let free_ptr = ptr.add(needed_size);
         if size >= needed_size + HEADER_SIZE {
+            // log::trace!("Adding block of size {}", size - needed_size);
             self.blocks.add_block(free_ptr, size - needed_size);
         } else if size > needed_size {
-            // Uh-oh. We have a bit of extra free memory, but not enough
-            // to add a header and call it a new free block.
+            // Uh-oh. We have a bit of extra free memory, but not enough to add
+            // a header and call it a new free block. This could happen if our
+            // page size was not a multiple of 16. Weird.
+            //
             // Log it and leak it, I guess...
             log::warn!("Leaking {} bytes at {:?}", size - needed_size, free_ptr);
         }
@@ -878,7 +897,7 @@ mod tests {
             // The algorithm returns the second half of the block
             assert_eq!(p32, pointers[1].add(32));
 
-            // We should now still have 32 bytes in 1 block in the block list
+            // We should now still have 32 bytes in 1 block in the block list (plus page leftovers)
 
             // Allocate 8 bytes and another 16 bytes, which should both fit in the block
             // and completely consume it - because the 8 bytes should expand to 16
@@ -895,8 +914,6 @@ mod tests {
             assert_eq!(p8, pointers[1].add(16));
             assert_eq!(p16, pointers[1]);
             log::info!("done: {}", allocator.blocks);
-
-            assert!(allocator.blocks.first.is_none());
         };
     }
 }
