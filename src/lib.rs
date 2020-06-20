@@ -240,7 +240,7 @@ impl FreeBlock {
 // - Each block should have a pointer < next.
 // - No two blocks should be precisely adjacent (those should be automatically
 //   merged on insertion).
-struct BlockList {
+pub struct BlockList {
     first: Option<FreeBlock>,
 }
 
@@ -278,7 +278,7 @@ impl fmt::Display for BlockList {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Validity {
     // Number of blocks overlapping other blocks.
     //
@@ -308,7 +308,7 @@ impl From<Validity> for bool {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Stats {
     pub length: usize,
     pub size: usize,
@@ -372,7 +372,7 @@ impl BlockList {
         // debug!("  pop_size got first");
         if first.size() == size {
             // debug!("  First block at {:?} is big enough", first.header);
-            self.first = None;
+            self.first = first.next();
             return Some(first.header as *mut u8);
         } else if first.size() >= size + HEADER_SIZE {
             let split = first.split(size);
@@ -406,7 +406,7 @@ impl BlockList {
         }
     }
 
-    // Add a block to the linked list. Takes ownership of ptr.
+    /// Add a block to the linked list. Takes ownership of ptr.
     unsafe fn add_block(&mut self, ptr: *mut u8, size: usize) {
         let mut new_block = FreeBlock::from_raw(ptr, None, size);
 
@@ -443,10 +443,15 @@ impl BlockList {
             }
             Relation::AdjacentAfter => {
                 // This block is just after the first block in the list, so we
-                // merge the two into a single block
-                new_block.header_mut().next = previous.header_mut().next;
-                let merged = previous.try_merge_next();
-                assert!(merged, "They were adjacent, they should merge");
+                // merge the two into a single block. This block isn't part of the list yet,
+                // and 'previous' already correctly points to the next block, so all we need to do
+                // is increase the 'previous' block size.
+                previous.header_mut().size += size;
+                // Now that 'previous' has grown, it's possible that 'previous'
+                // is now adjacent to 'next', so we try and merge them. This may
+                // or may not actually happen, and either way, we're left with a
+                // valid list afterwards.
+                previous.try_merge_next();
                 return;
             }
             _ => {}
@@ -483,7 +488,6 @@ impl BlockList {
         }
     }
 
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         let mut parent = match self.first {
             None => return 0,
@@ -498,14 +502,34 @@ impl BlockList {
 
         length
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
 }
 
 // Round up value to the nearest multiple of increment
 fn round_up(value: usize, increment: usize) -> usize {
+    if value == 0 {
+        return 0;
+    }
     increment * ((value - 1) / increment + 1)
 }
 
-trait HeapGrower {
+pub trait HeapGrower {
+    /// Grow the heap by at least size. Returns a pointer and the size of the
+    /// memory available at that pointer.
+    ///
+    /// # Safety
+    ///
+    /// This is pretty much entirely unsafe.
+    ///
+    /// For this to function properly with the other types in this module:
+    ///
+    /// - The return value may be (null, 0), indicating allocation failure.
+    /// - The return value may be (ptr, new_size), where new_size >= size, and
+    ///   where the memory pointed to by ptr must be available and untracked by
+    ///   any other rust code, including the allocator itself.
     unsafe fn grow_heap(&mut self, size: usize) -> (*mut u8, usize);
 }
 
@@ -543,18 +567,25 @@ impl HeapGrower for UnixHeapGrower {
             0,
         );
 
-        if !ptr.is_null() {
-            self.pages += to_allocate / pagesize;
-            self.growths += 1;
+        if ptr.is_null() {
+            // panic!("No memory allocated!");
+            return (ptr as *mut u8, 0);
         }
+
+        self.pages += to_allocate / pagesize;
+        self.growths += 1;
 
         (ptr as *mut u8, to_allocate)
     }
 }
 
-struct RawAlloc<G> {
-    grower: G,
-    blocks: BlockList,
+// A raw allocator, capable of growing the heap, returning pointers to new
+// allocations, and tracking and reusing freed memory.
+//
+// Note: It never returns memory to the heap.
+pub struct RawAlloc<G> {
+    pub grower: G,
+    pub blocks: BlockList,
 }
 
 impl<G: HeapGrower + Default> Default for RawAlloc<G> {
@@ -579,18 +610,27 @@ impl<G: HeapGrower> RawAlloc<G> {
         self.blocks.stats()
     }
 
-    fn aligned_size(layout: Layout) -> usize {
+    /// Calculate the minimum size of a block to be allocated for the given layout.
+    pub fn block_size(layout: Layout) -> usize {
         // We align everything to 16 bytes, and all blocks are at least 16 bytes.
         // Its pretty wasteful, but easy!
-        let layout = layout.align_to(16).expect("Whoa, serious memory issues");
-        layout.pad_to_align().size() as usize
+        let aligned_layout = layout
+            .align_to(16)
+            .expect("Whoa, serious memory issues")
+            .pad_to_align();
+        aligned_layout.size()
     }
 
     ////////////////////////////////////////////////////////////
     // Functions for implementing GlobalAlloc
 
-    unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
-        let needed_size = RawAlloc::<G>::aligned_size(layout);
+    /// Allocate space for something fitting in layout
+    ///
+    /// # Safety
+    ///
+    /// This is very unsafe. See GlobalAlloc for details.
+    pub unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
+        let needed_size = RawAlloc::<G>::block_size(layout);
         // debug!("Allocating {} bytes", needed_size);
 
         if let Some(ptr) = self.blocks.pop_size(needed_size) {
@@ -615,8 +655,13 @@ impl<G: HeapGrower> RawAlloc<G> {
         ptr
     }
 
-    unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
-        let size = RawAlloc::<G>::aligned_size(layout);
+    /// Deallocate (or "free") a memory block.
+    ///
+    /// # Safety
+    ///
+    /// This is very unsafe. See GlobalAlloc for details.
+    pub unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
+        let size = RawAlloc::<G>::block_size(layout);
         self.blocks.add_block(ptr, size);
     }
 }
@@ -707,20 +752,18 @@ impl BasicUnixAlloc {
 
 unsafe impl GlobalAlloc for BasicUnixAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // println!("Allocating!");
         self.alloc.get_raw().alloc(layout)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // println!("Deallocating!");
         self.alloc.get_raw().dealloc(ptr, layout)
     }
 }
 
 pub struct ToyHeap {
-    page_size: usize,
-    size: usize,
-    heap: [u8; 1024],
+    pub page_size: usize,
+    pub size: usize,
+    pub heap: [u8; 256 * 1024],
 }
 
 impl Default for ToyHeap {
@@ -728,7 +771,7 @@ impl Default for ToyHeap {
         ToyHeap {
             page_size: 64,
             size: 0,
-            heap: [0; 1024],
+            heap: [0; 256 * 1024],
         }
     }
 }
