@@ -9,7 +9,6 @@ use core::ops::Range;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use log::debug;
 use spin::{Mutex, MutexGuard};
 use static_assertions::const_assert;
 
@@ -194,18 +193,17 @@ impl FreeBlock {
         }
 
         unsafe {
-            let self_size = self.size();
+            // let self_size = self.size();
             let header = self.header_mut();
             header.size -= size;
-            let ptr = (header as *mut FreeHeader as *mut u8).add(header.size);
-            debug!(
-                "Splitting {} bytes off from {:?}:{} to get {:?}",
-                size,
-                (header as *mut FreeHeader as *mut u8),
-                self_size,
-                ptr,
-            );
-            ptr
+            (header as *mut FreeHeader as *mut u8).add(header.size)
+            // log::trace!(
+            //     "Splitting {} bytes off from {:?}:{} to get {:?}",
+            //     size,
+            //     (header as *mut FreeHeader as *mut u8),
+            //     self_size,
+            //     ptr,
+            // );
         }
     }
 
@@ -275,31 +273,31 @@ impl fmt::Display for BlockList {
 impl BlockList {
     // Find and remove a chunk of size 'size' from the linked list
     fn pop_size(&mut self, size: usize) -> Option<*mut u8> {
-        debug!("pop_size({})", size);
+        // debug!("pop_size({})", size);
 
         let mut first = self.first?;
-        debug!("  pop_size got first");
+        // debug!("  pop_size got first");
         if first.size() == size {
-            debug!("  First block at {:?} is big enough", first.header);
+            // debug!("  First block at {:?} is big enough", first.header);
             self.first = None;
             return Some(first.header as *mut u8);
         } else if first.size() >= size + HEADER_SIZE {
             let split = first.split(size);
-            debug!(
-                "  Split off from first block at {:?} to {:?}",
-                first.header, split,
-            );
+            // debug!(
+            //     "  Split off from first block at {:?} to {:?}",
+            //     first.header, split,
+            // );
             return Some(split);
         }
 
         let mut parent = first;
         loop {
             let mut next = parent.next()?;
-            debug!("  Checking block at {:?} Size {}", next.header, next.size());
+            // debug!("  Checking block at {:?} Size {}", next.header, next.size());
 
             if next.size() == size {
                 let (ptr, _) = parent.pop_next();
-                debug!("  Found correctly sized block at {:?}", ptr);
+                // debug!("  Found correctly sized block at {:?}", ptr);
                 return Some(ptr);
             }
 
@@ -310,7 +308,7 @@ impl BlockList {
             }
 
             // This block is bigger than we need, split it
-            debug!("  Found big block at {:?}", next.header);
+            // debug!("  Found big block at {:?}", next.header);
             return Some(next.split(size));
         }
     }
@@ -319,52 +317,75 @@ impl BlockList {
     unsafe fn add_block(&mut self, ptr: *mut u8, size: usize) {
         let mut new_block = FreeBlock::from_raw(ptr, None, size);
 
-        let mut parent = match self.first {
+        let mut previous = match self.first {
             None => {
+                // There are no blocks in this list, so we make this the head of
+                // the list and return
                 self.first = Some(new_block);
                 return;
             }
             Some(p) => p,
         };
 
-        match new_block.relation(&parent) {
+        // We keep the list in sorted order, by pointer, to enable merging.
+        match new_block.relation(&previous) {
             Relation::Before => {
-                new_block.header_mut().next = parent.header;
+                // This block is well before the first one in the list, so we
+                // add this to the head of the list
+                new_block.header_mut().next = previous.header;
                 self.first = Some(new_block);
                 return;
             }
             Relation::AdjacentBefore => {
-                new_block.header_mut().next = parent.header;
+                // This block is just before the first block in the list, so we
+                // merge the two into a single block
+                new_block.header_mut().next = previous.header;
                 let merged = new_block.try_merge_next();
                 assert!(merged, "They were adjacent, they should merge");
                 return;
             }
             Relation::Overlapping => {
+                // These blocks both claim the same memory
                 panic!("Overlapping memory blocks OH NO");
             }
-            Relation::AdjacentAfter => {}
+            Relation::AdjacentAfter => {
+                // This block is just after the first block in the list, so we
+                // merge the two into a single block
+                new_block.header_mut().next = previous.header_mut().next;
+                let merged = previous.try_merge_next();
+                assert!(merged, "They were adjacent, they should merge");
+                return;
+            }
             _ => {}
         }
 
+        // Loop through the list of blocks, to find where this one should be
+        // inserted. Once its place in the list is found, we merge with the
+        // previous and/or next if we can, and if not, insert it into
+        // the list.
         loop {
-            let next = match parent.next() {
+            // By construction, previous < new_block. Now we check previous.next
+            // to see if previous < new_block < next, in which case we insert
+            // and merge, or if next < new_block, we continue iterating through
+            // the list.
+            let next = match previous.next() {
                 Some(n) => n,
                 None => {
-                    // We've reached the end of the list, let's append this to
-                    // the list
-                    parent.insert_merge(ptr, size);
+                    // previous < new_block, and nothing
+                    previous.insert_merge(ptr, size);
                     return;
                 }
             };
 
             if (next.header as *const u8) < ptr {
-                parent = next;
+                // next < pointer, so we continue iterating
+                previous = next;
                 continue;
             }
 
-            // If we are here, it means parent > ptr > next.
+            // If we are here, it means previous < ptr < next.
             // Time to insert_merge
-            parent.insert_merge(ptr, size);
+            previous.insert_merge(ptr, size);
             return;
         }
     }
@@ -386,16 +407,55 @@ impl BlockList {
     }
 }
 
+// Round up value to the nearest multiple of increment
+fn round_up(value: usize, increment: usize) -> usize {
+    increment * ((value - 1) / increment + 1)
+}
+
 trait HeapGrower {
-    unsafe fn grow_heap(&mut self, size: usize) -> *mut u8;
+    unsafe fn grow_heap(&mut self, size: usize) -> (*mut u8, usize);
 }
 
 #[derive(Default)]
-struct UnixHeapGrower;
+struct UnixHeapGrower {
+    // Just for tracking, not really needed
+    pages: usize,
+    growths: usize,
+}
 
 impl HeapGrower for UnixHeapGrower {
-    unsafe fn grow_heap(&mut self, size: usize) -> *mut u8 {
-        libc::sbrk(size as i32) as *mut u8
+    unsafe fn grow_heap(&mut self, size: usize) -> (*mut u8, usize) {
+        if size == 0 {
+            return (null_mut(), 0);
+        }
+        let pagesize = sysconf::page::pagesize();
+        let to_allocate = round_up(size, pagesize);
+        let ptr = libc::mmap(
+            // Address we want the memory at. We don't care, so null it is.
+            null_mut(),
+            // Amount of memory to allocate
+            to_allocate,
+            // We want read/write access to this memory
+            libc::PROT_WRITE | libc::PROT_READ,
+            // MAP_ANON: We don't want a file descriptor, we're just going to
+            //   use the memory.
+            //
+            // MAP_PRIVATE: We're not sharing this with any other process.
+            //
+            // Well, I'm pretty unsure about these choices, but they seem to work...
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            // The file descriptor we want memory mapped. We don't want a memory
+            // mapped file, so 0 it is.
+            0,
+            0,
+        );
+
+        if !ptr.is_null() {
+            self.pages += to_allocate / pagesize;
+            self.growths += 1;
+        }
+
+        (ptr as *mut u8, to_allocate)
     }
 }
 
@@ -422,10 +482,6 @@ impl<G: HeapGrower> RawAlloc<G> {
         }
     }
 
-    unsafe fn new_block(&mut self, size: usize) -> *mut u8 {
-        self.grower.grow_heap(size)
-    }
-
     fn aligned_size(layout: Layout) -> usize {
         // We align everything to 16 bytes, and all blocks are at least 16 bytes.
         // Its pretty wasteful, but easy!
@@ -438,12 +494,28 @@ impl<G: HeapGrower> RawAlloc<G> {
 
     unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
         let needed_size = RawAlloc::<G>::aligned_size(layout);
-        debug!("Allocating {} bytes", needed_size);
+        // debug!("Allocating {} bytes", needed_size);
 
         if let Some(ptr) = self.blocks.pop_size(needed_size) {
             return ptr;
         }
-        self.new_block(needed_size)
+
+        let (ptr, size) = self.grower.grow_heap(needed_size);
+        if size == needed_size {
+            return ptr;
+        }
+
+        let free_ptr = ptr.add(needed_size);
+        if size >= needed_size + HEADER_SIZE {
+            self.blocks.add_block(free_ptr, size - needed_size);
+        } else if size > needed_size {
+            // Uh-oh. We have a bit of extra free memory, but not enough
+            // to add a header and call it a new free block.
+            // Log it and leak it, I guess...
+            log::warn!("Leaking {} bytes at {:?}", size - needed_size, free_ptr);
+        }
+
+        ptr
     }
 
     unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
@@ -485,6 +557,7 @@ impl<G: HeapGrower + Default> BasicAlloc<G> {
         // most efficient. This could probably be downgraded, but would require
         // some analysis and understanding to do so.
         let mut state = self.init.compare_and_swap(0, 1, Ordering::SeqCst);
+        // log::info!("state: {}", state);
         if state == 0 {
             // We haven't initialized, so we do that now.
             let mx: &mut Mutex<RawAlloc<G>> = unsafe {
@@ -502,6 +575,7 @@ impl<G: HeapGrower + Default> BasicAlloc<G> {
         }
 
         while state == 1 {
+            // log::info!("Spinning!");
             // Spin while we wait for the state to become 2
             core::sync::atomic::spin_loop_hint();
             state = self.init.load(Ordering::SeqCst);
@@ -528,15 +602,18 @@ impl BasicUnixAlloc {
 
 unsafe impl GlobalAlloc for BasicUnixAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // println!("Allocating!");
         self.alloc.get_raw().alloc(layout)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // println!("Deallocating!");
         self.alloc.get_raw().dealloc(ptr, layout)
     }
 }
 
 pub struct ToyHeap {
+    page_size: usize,
     size: usize,
     heap: [u8; 1024],
 }
@@ -544,6 +621,7 @@ pub struct ToyHeap {
 impl Default for ToyHeap {
     fn default() -> Self {
         ToyHeap {
+            page_size: 64,
             size: 0,
             heap: [0; 1024],
         }
@@ -551,13 +629,15 @@ impl Default for ToyHeap {
 }
 
 impl HeapGrower for ToyHeap {
-    unsafe fn grow_heap(&mut self, size: usize) -> *mut u8 {
+    unsafe fn grow_heap(&mut self, size: usize) -> (*mut u8, usize) {
         if self.size + size > self.heap.len() {
-            return null_mut();
+            return (null_mut(), 0);
         }
+
+        let allocating = round_up(size, self.page_size);
         let ptr = self.heap.as_mut_ptr().add(self.size);
-        self.size += size;
-        ptr
+        self.size += allocating;
+        (ptr, allocating)
     }
 }
 
@@ -596,8 +676,12 @@ mod tests {
         }
 
         let toy_heap = &allocator.grower;
+        let page_size = toy_heap.page_size;
         // Toy heap should be the same size as the blocks requested
-        assert_eq!(toy_heap.size, layouts.iter().map(|l| l.size()).sum());
+        let total_allocated: usize = layouts.iter().map(|l| l.size()).sum();
+        let page_space = round_up(total_allocated, page_size);
+
+        assert_eq!(toy_heap.size, page_space);
 
         ////////////////////////////////////////////////////////////
         // Deallocation
@@ -614,7 +698,11 @@ mod tests {
             .as_mut()
             .expect("This should not be null");
         assert_eq!(first.size(), layouts[1].size());
-        assert!(first.next().is_none());
+        let next = first.next();
+        log::info!("dealloc: {}", allocator.blocks);
+        // We should still have the remainder left over from the last page
+        // allocation
+        assert!(next.is_some());
 
         // The block list now has 1 64-byte block on it
         log::info!("post-alloc: {}", allocator.blocks);
@@ -623,7 +711,10 @@ mod tests {
         unsafe {
             // Allocate 112 bytes, more than fits in the block on the block list
             let newp = allocator.alloc(Layout::from_size_align(112, 16).unwrap());
-            assert_eq!(newp, pointers[2].add(layouts[2].size()));
+            assert_eq!(
+                newp,
+                pointers[2].add(round_up(layouts[2].size(), page_size))
+            );
             log::info!("p112: {}", allocator.blocks);
 
             // Allocate 32 bytes, which should fit in the block
