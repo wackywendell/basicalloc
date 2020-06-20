@@ -3,12 +3,14 @@
 //! A basic memory allocator.
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::cell::UnsafeCell;
 use core::fmt;
+use core::mem::MaybeUninit;
 use core::ops::Range;
 use core::ptr::null_mut;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use log::debug;
+use spin::{Mutex, MutexGuard};
 use static_assertions::const_assert;
 
 // The header for our free blocks.
@@ -236,6 +238,14 @@ struct BlockList {
     first: Option<FreeBlock>,
 }
 
+// A BlockList is sendable - as long as the whole "chain" is maintained across
+// threads, its fine.
+//
+// With some tweaking and atomic pointer swapping, we could make a thread-safe
+// version of BlockList, but that's more trouble than I'm willing to go to right
+// now
+unsafe impl Send for FreeBlock {}
+
 impl Default for BlockList {
     fn default() -> Self {
         BlockList { first: None }
@@ -271,6 +281,7 @@ impl BlockList {
         debug!("  pop_size got first");
         if first.size() == size {
             debug!("  First block at {:?} is big enough", first.header);
+            self.first = None;
             return Some(first.header as *mut u8);
         } else if first.size() >= size + HEADER_SIZE {
             let split = first.split(size);
@@ -379,6 +390,7 @@ trait HeapGrower {
     unsafe fn grow_heap(&mut self, size: usize) -> *mut u8;
 }
 
+#[derive(Default)]
 struct UnixHeapGrower;
 
 impl HeapGrower for UnixHeapGrower {
@@ -387,32 +399,31 @@ impl HeapGrower for UnixHeapGrower {
     }
 }
 
-struct BasicAlloc<G: HeapGrower> {
-    grower: UnsafeCell<G>,
-    blocks: UnsafeCell<BlockList>,
+struct RawAlloc<G> {
+    grower: G,
+    blocks: BlockList,
 }
 
-impl<G: HeapGrower + Default> Default for BasicAlloc<G> {
+impl<G: HeapGrower + Default> Default for RawAlloc<G> {
     fn default() -> Self {
-        BasicAlloc {
-            grower: UnsafeCell::from(G::default()),
-            blocks: UnsafeCell::from(BlockList::default()),
+        RawAlloc {
+            grower: G::default(),
+            blocks: BlockList::default(),
         }
     }
 }
 
-impl<G: HeapGrower> BasicAlloc<G> {
+impl<G: HeapGrower> RawAlloc<G> {
     #[allow(dead_code)]
     pub fn new(grower: G) -> Self {
-        BasicAlloc {
-            grower: UnsafeCell::from(grower),
-            blocks: UnsafeCell::from(BlockList::default()),
+        RawAlloc {
+            grower,
+            blocks: BlockList::default(),
         }
     }
 
-    unsafe fn new_block(&self, size: usize) -> *mut u8 {
-        let grower = self.grower.get().as_mut().unwrap();
-        grower.grow_heap(size)
+    unsafe fn new_block(&mut self, size: usize) -> *mut u8 {
+        self.grower.grow_heap(size)
     }
 
     fn aligned_size(layout: Layout) -> usize {
@@ -421,47 +432,107 @@ impl<G: HeapGrower> BasicAlloc<G> {
         let layout = layout.align_to(16).expect("Whoa, serious memory issues");
         layout.pad_to_align().size() as usize
     }
-}
 
-unsafe impl<G: HeapGrower> GlobalAlloc for BasicAlloc<G> {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let needed_size = BasicAlloc::<G>::aligned_size(layout);
+    ////////////////////////////////////////////////////////////
+    // Functions for implementing GlobalAlloc
+
+    unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
+        let needed_size = RawAlloc::<G>::aligned_size(layout);
         debug!("Allocating {} bytes", needed_size);
 
-        let blocks_ptr = self.blocks.get();
-        let blocks = match blocks_ptr.as_mut() {
-            None => return self.new_block(needed_size),
-            Some(b) => b,
-        };
-
-        if let Some(ptr) = blocks.pop_size(needed_size) {
+        if let Some(ptr) = self.blocks.pop_size(needed_size) {
             return ptr;
         }
         self.new_block(needed_size)
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let size = BasicAlloc::<G>::aligned_size(layout);
-        let blocks_ptr = self.blocks.get();
-        let blocks = blocks_ptr
-            .as_mut()
-            .expect("Unexpected null pointer to BlockList");
-
-        blocks.add_block(ptr, size);
+    unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
+        let size = RawAlloc::<G>::aligned_size(layout);
+        self.blocks.add_block(ptr, size);
     }
 }
 
+// A thread-safe allocator.
+struct BasicAlloc<G> {
+    // Values:
+    // - 0: Untouched
+    // - 1: Initialization in progress
+    // - 2: Initialized
+    init: AtomicU8,
+    raw: MaybeUninit<Mutex<RawAlloc<G>>>,
+}
+
+impl<G: HeapGrower + Default> Default for BasicAlloc<G> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<G> BasicAlloc<G> {
+    pub const fn new() -> Self {
+        BasicAlloc {
+            init: AtomicU8::new(0),
+            raw: MaybeUninit::uninit(),
+        }
+    }
+}
+
+impl<G: HeapGrower + Default> BasicAlloc<G> {
+    pub fn get_raw(&self) -> MutexGuard<RawAlloc<G>> {
+        // First, we check
+        //
+        // The ordering here is SeqCst because that's the safest, if not the
+        // most efficient. This could probably be downgraded, but would require
+        // some analysis and understanding to do so.
+        let mut state = self.init.compare_and_swap(0, 1, Ordering::SeqCst);
+        if state == 0 {
+            // We haven't initialized, so we do that now.
+            let mx: &mut Mutex<RawAlloc<G>> = unsafe {
+                // We cast the raw pointer to be
+                let raw_loc: *const Mutex<RawAlloc<G>> = self.raw.as_ptr();
+                let raw_mut: *mut Mutex<RawAlloc<G>> = raw_loc as *mut Mutex<RawAlloc<G>>;
+                raw_mut.write(Mutex::new(RawAlloc::default()));
+                raw_mut.as_mut().unwrap()
+            };
+
+            // Let other threads know that the mutex and raw allocator are now initialized,
+            // and they are free to use the mutex to access the raw allocator
+            self.init.store(2, Ordering::SeqCst);
+            return mx.lock();
+        }
+
+        while state == 1 {
+            // Spin while we wait for the state to become 2
+            core::sync::atomic::spin_loop_hint();
+            state = self.init.load(Ordering::SeqCst);
+        }
+
+        let ptr = unsafe { self.raw.as_ptr().as_ref().unwrap() };
+
+        ptr.lock()
+    }
+}
+
+#[derive(Default)]
 pub struct BasicUnixAlloc {
     alloc: BasicAlloc<UnixHeapGrower>,
 }
 
+impl BasicUnixAlloc {
+    pub const fn new() -> Self {
+        BasicUnixAlloc {
+            alloc: BasicAlloc::new(),
+        }
+    }
+}
+
 unsafe impl GlobalAlloc for BasicUnixAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.alloc.alloc(layout)
+        self.alloc.get_raw().alloc(layout)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.alloc.dealloc(ptr, layout)
+        self.alloc.get_raw().dealloc(ptr, layout)
     }
 }
 
@@ -482,7 +553,7 @@ impl Default for ToyHeap {
 impl HeapGrower for ToyHeap {
     unsafe fn grow_heap(&mut self, size: usize) -> *mut u8 {
         if self.size + size > self.heap.len() {
-            panic!("Out of memory in this little toy heap!");
+            return null_mut();
         }
         let ptr = self.heap.as_mut_ptr().add(self.size);
         self.size += size;
@@ -496,21 +567,10 @@ mod tests {
 
     use test_env_log::test;
 
-    // Useful for debugging
-    fn get_blocks<G: HeapGrower>(alloc: &BasicAlloc<G>) -> &BlockList {
-        unsafe {
-            alloc
-                .blocks
-                .get()
-                .as_mut()
-                .expect("There should be a block list here")
-        }
-    }
-
     #[test]
     fn test_basic() {
         let toy_heap = ToyHeap::default();
-        let allocator = BasicAlloc::new(toy_heap);
+        let mut allocator = RawAlloc::new(toy_heap);
 
         const BLOCKS: usize = 3;
 
@@ -535,13 +595,7 @@ mod tests {
             assert_eq!(expected, found);
         }
 
-        let toy_heap = unsafe {
-            allocator
-                .grower
-                .get()
-                .as_mut()
-                .expect("There should be a heap here")
-        };
+        let toy_heap = &allocator.grower;
         // Toy heap should be the same size as the blocks requested
         assert_eq!(toy_heap.size, layouts.iter().map(|l| l.size()).sum());
 
@@ -552,29 +606,25 @@ mod tests {
         unsafe { allocator.dealloc(pointers[1], layouts[1]) };
 
         // Check that the block list is as expected
-        unsafe {
-            let blocks = allocator
-                .blocks
-                .get()
-                .as_mut()
-                .expect("There should be a block list here");
+        assert!(allocator.blocks.first.is_some());
 
-            assert!(blocks.first.is_some());
+        let first = allocator
+            .blocks
+            .first
+            .as_mut()
+            .expect("This should not be null");
+        assert_eq!(first.size(), layouts[1].size());
+        assert!(first.next().is_none());
 
-            let first = blocks.first.as_mut().expect("This should not be null");
-            assert_eq!(first.size(), layouts[1].size());
-            assert!(first.next().is_none());
-
-            // The block list now has 1 64-byte block on it
-            log::info!("post-alloc: {}", blocks);
-        };
-
+        // The block list now has 1 64-byte block on it
+        log::info!("post-alloc: {}", allocator.blocks);
         ////////////////////////////////////////////////////////////
         // Allocation with a block list
         unsafe {
             // Allocate 112 bytes, more than fits in the block on the block list
             let newp = allocator.alloc(Layout::from_size_align(112, 16).unwrap());
             assert_eq!(newp, pointers[2].add(layouts[2].size()));
+            log::info!("p112: {}", allocator.blocks);
 
             // Allocate 32 bytes, which should fit in the block
             let p32 = allocator.alloc(Layout::from_size_align(32, 16).unwrap());
@@ -585,23 +635,17 @@ mod tests {
 
             // Allocate 8 bytes and another 16 bytes, which should both fit in the block
             // and completely consume it - because the 8 bytes should expand to 16
-            log::info!("p32: {}", get_blocks(&allocator));
+            log::info!("p32: {}", allocator.blocks);
             let p8 = allocator.alloc(Layout::from_size_align(16, 4).unwrap());
-            log::info!("p8: {}", get_blocks(&allocator));
+            log::info!("p8: {}", allocator.blocks);
             let p16 = allocator.alloc(Layout::from_size_align(8, 1).unwrap());
             // The algorithm returns the second half of the block
-            log::info!("p16: {}", get_blocks(&allocator));
+            log::info!("p16: {}", allocator.blocks);
             assert_eq!(p8, pointers[1].add(16));
             assert_eq!(p16, pointers[1]);
+            log::info!("done: {}", allocator.blocks);
 
-            // And now our block list should be empty
-            let blocks = allocator
-                .blocks
-                .get()
-                .as_mut()
-                .expect("There should be a block list here");
-
-            assert!(blocks.first.is_none());
+            assert!(allocator.blocks.first.is_none());
         };
     }
 }
