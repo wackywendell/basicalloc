@@ -1,7 +1,7 @@
 use basicalloc::BasicUnixAlloc;
 
 #[global_allocator]
-static A: BasicUnixAlloc = BasicUnixAlloc::new();
+static ALLOCATOR: BasicUnixAlloc = BasicUnixAlloc::new();
 
 fn main() {
     env_logger::init();
@@ -12,8 +12,11 @@ fn main() {
 
     let mut v = vec![0, 1, 2, 3];
     for n in 10..2048 {
-        // log::debug!("Pushing {}", n);
+        log::debug!("Pushing {}", n);
         v.push(n);
     }
-    println!("Got a vec {}", v.len());
+
+    let (validity, stats) = ALLOCATOR.stats();
+    println!("Valid: {:?}", validity);
+    println!("Stats: {:?}", stats);
 }
