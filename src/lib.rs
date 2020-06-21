@@ -71,10 +71,9 @@ use static_assertions::const_assert;
 /// We use C representation and align to 16 bytes for... simplicity. This is
 /// perhaps a stronger constraint that we need, but it does make things simple
 /// and straightforward.
-#[derive(Copy, Clone)]
 #[repr(C, align(16))]
 pub struct FreeHeader {
-    next: *mut FreeHeader,
+    next: Option<FreeBlock>,
     size: usize,
 }
 
@@ -112,7 +111,7 @@ impl FreeHeader {
     #[allow(clippy::cast_ptr_alignment)]
     pub unsafe fn from_raw(
         ptr: NonNull<u8>,
-        next: *mut FreeHeader,
+        next: Option<FreeBlock>,
         size: usize,
     ) -> NonNull<FreeHeader> {
         let header = FreeHeader { next, size };
@@ -122,16 +121,15 @@ impl FreeHeader {
     }
 }
 
-/// A `FreeBlock` is a wrapper around a pointer to a freed block to be maintained
-/// in a [`BlockList`](struct.BlockList.html).
+/// A `FreeBlock` is a wrapper around a pointer to a freed block to be
+/// maintained in a [`BlockList`](struct.BlockList.html).
 ///
-/// Invariants that should be maintained:
+/// Invariants are enforced by / inherited from the NonNull strict.
 ///
-/// - header should never be a null pointer
-/// - header.next should be null or point to a valid FreeBlock
-/// - Any safe functions should preserve LinkedLists
-#[derive(Copy, Clone)]
-struct FreeBlock {
+/// Note that this is very similar to Box, except that it doesn't assume a heap
+/// or memory allocator, so it doesn't implement Clone or Drop, and it also has
+/// a 'next'.
+pub struct FreeBlock {
     header: NonNull<FreeHeader>,
 }
 
@@ -147,12 +145,12 @@ impl FreeBlock {
     /// by or accessible by any program logic.
     ///
     /// Further safety constraints are enforced by the invariants of `BlockList`.
+    #[must_use]
     pub unsafe fn from_raw(ptr: NonNull<u8>, next: Option<FreeBlock>, size: usize) -> FreeBlock {
         if size < HEADER_SIZE {
             panic!("Can't recapture a block smaller than HEADER_SIZE");
         }
-        let next_ptr = next.map(|b| b.header.as_ptr()).unwrap_or(null_mut());
-        let header = FreeHeader::from_raw(ptr, next_ptr, size);
+        let header = FreeHeader::from_raw(ptr, next, size);
         FreeBlock { header }
     }
 
@@ -191,14 +189,25 @@ impl FreeBlock {
     }
 
     /// Get the next block over from this one.
-    fn next(&self) -> Option<Self> {
-        let next = self.header_view().next;
-        if next.is_null() {
-            return None;
-        }
-        Some(FreeBlock {
-            header: unsafe { NonNull::new_unchecked(next) },
-        })
+    fn next(&self) -> Option<&Self> {
+        (&self.header_view().next).into()
+    }
+
+    /// Get the next block over from this one.
+    fn next_mut(&mut self) -> Option<&mut Self> {
+        unsafe { (&mut self.header_mut().next).into() }
+    }
+
+    /// Remove the next, and return it
+    #[must_use]
+    fn take_next(&mut self) -> Option<Self> {
+        unsafe { (&mut self.header_mut().next).take() }
+    }
+
+    /// Set this block's next to new_next, and return the old one
+    #[must_use]
+    fn replace_next(&mut self, new_next: FreeBlock) -> Option<Self> {
+        unsafe { (&mut self.header_mut().next).replace(new_next) }
     }
 
     /// The size of the block, in bytes.
@@ -226,21 +235,22 @@ impl FreeBlock {
     ///
     /// As is required in a linked list, this will set self.next = next.next.
     ///
-    /// If next is null, returns a null pointer and size 0.
-    pub fn pop_next(&mut self) -> (Option<NonNull<u8>>, usize) {
-        let header = unsafe { self.header_mut() };
-
-        let next = if header.next.is_null() {
-            return (None, 0);
-        } else {
-            unsafe { NonNull::new_unchecked(header.next) }
+    /// If there is no next, returns (None, 0).
+    #[must_use]
+    pub fn pop_next(&mut self) -> Option<FreeBlock> {
+        let mut next = match self.take_next() {
+            None => {
+                return None;
+            }
+            Some(n) => n,
         };
 
-        let block = FreeBlock { header: next };
         // Update this block to look to next's next, cutting next out of the chain
-        header.next = block.header_view().next;
+        if let Some(next_next) = next.take_next() {
+            assert!(self.replace_next(next_next).is_none());
+        }
 
-        (Some(block.header.cast()), block.size())
+        Some(next)
     }
 
     /// Insert a new element, after this one, maintaining linked list invariants.
@@ -248,9 +258,11 @@ impl FreeBlock {
     /// # Safety
     ///
     /// `ptr` must be a pointer to valid, freed memory of size `size`.
-    pub unsafe fn insert(&mut self, ptr: NonNull<u8>, size: usize) {
-        let block = FreeBlock::from_raw(ptr, self.next(), size);
-        self.header_mut().next = block.header.as_ptr();
+    pub unsafe fn insert(&mut self, block: FreeBlock) {
+        let mut inserting = block;
+        let next_next = self.header_mut().next.take();
+        inserting.header_mut().next = next_next;
+        self.header_mut().next = Some(inserting);
     }
 
     /// Insert a new element, after this one, maintaining linked list invariants
@@ -262,15 +274,16 @@ impl FreeBlock {
     /// `ptr` must be a pointer to valid, freed memory of size `size`. To
     /// maintain `BlockList` invariants, `ptr` must also be greater then
     /// self.header, and less than self.next (or self.next must be null).
-    unsafe fn insert_merge(&mut self, ptr: NonNull<u8>, size: usize) -> usize {
-        let end = (self.header.as_ptr() as *const u8).add(self.size());
+    unsafe fn insert_merge(&mut self, block: FreeBlock) -> usize {
+        let this_end = self.as_range().end;
+        let other_start = block.as_range().start;
 
-        let (merges, mut try_next) = if end == ptr.as_ptr() {
-            self.header_mut().size += size;
-            (1, *self)
+        let (merges, try_next) = if this_end == other_start {
+            self.header_mut().size += block.size();
+            (1, self)
         } else {
-            self.insert(ptr, size);
-            (0, self.next().unwrap())
+            self.insert(block);
+            (0, self.next_mut().unwrap())
         };
 
         merges + if try_next.try_merge_next() { 1 } else { 0 }
@@ -316,19 +329,19 @@ impl FreeBlock {
     /// block, the two will merge and this will return True; otherwise, this will
     /// return False.
     pub fn try_merge_next(&mut self) -> bool {
-        let next = match self.next() {
+        let (next_start, next_size) = match self.next() {
             None => return false,
-            Some(block) => block,
+            Some(block) => (block.as_range().start, block.size()),
         };
-        let end = self.as_range().end;
-        if end != next.as_range().start {
+        if self.as_range().end != next_start {
             return false;
         };
 
         unsafe {
             let header = self.header_mut();
-            header.size += next.size();
-            header.next = next.header_view().next;
+            header.size += next_size;
+            let mut next = header.next.take().unwrap();
+            header.next = next.header_mut().next.take();
         }
 
         true
@@ -354,6 +367,43 @@ pub struct BlockList {
     first: Option<FreeBlock>,
 }
 
+pub struct BlockIter<'list> {
+    next: Option<&'list FreeBlock>,
+}
+
+impl<'list> Iterator for BlockIter<'list> {
+    type Item = &'list FreeBlock;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let next = self.next.take()?;
+
+        self.next = next.next();
+
+        Some(next)
+    }
+}
+
+// pub struct BlockIterMut<'list> {
+//     next: Option<&'list mut FreeBlock>,
+// }
+
+// impl<'list> Iterator for BlockIterMut<'list> {
+//     type Item = &'list mut FreeBlock;
+
+//     fn next(&mut self) -> Option<Self::Item> {
+//         self.next.take().map(|node| {
+//             self.next = node.next_mut().map(|node| &mut *node);
+//             node
+//         })
+
+//         // let next = self.next.take()?;
+
+//         // self.next = next.next_mut();
+
+//         // Some(next)
+//     }
+// }
+
 // A BlockList is sendable - as long as the whole "chain" is maintained across
 // threads, its fine.
 //
@@ -368,20 +418,39 @@ impl Default for BlockList {
     }
 }
 
+impl<'list> IntoIterator for &'list BlockList {
+    type Item = &'list FreeBlock;
+    type IntoIter = BlockIter<'list>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        BlockIter {
+            next: self.first.as_ref(),
+        }
+    }
+}
+
+// impl<'list> IntoIterator for &'list mut BlockList {
+//     type Item = &'list mut FreeBlock;
+//     type IntoIter = BlockIterMut<'list>;
+
+//     fn into_iter(self) -> Self::IntoIter {
+//         BlockIterMut {
+//             next: self.first.as_mut(),
+//         }
+//     }
+// }
+
 impl fmt::Display for BlockList {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "BlockList(")?;
-        let mut next = self.first;
         let mut start = true;
-        while let Some(ref block) = next {
+        for block in self {
             if !start {
                 write!(f, ", ")?;
             } else {
                 start = false;
             }
             write!(f, "FreeBlock({:?}, {})", block.header, block.size())?;
-
-            next = block.next();
         }
 
         write!(f, ")")
@@ -427,51 +496,85 @@ pub struct Stats {
     pub size: usize,
 }
 
+/// State after a single "apply".
+pub enum ApplyState<C, R> {
+    // Keep going, and pass C into the next 'apply'
+    Continue(C),
+    // Finish iterating, and return Some(R)
+    Finished(R),
+    // Finish iterating, and return None
+    Fail,
+}
+
 impl BlockList {
+    pub fn iter(&self) -> BlockIter {
+        BlockIter {
+            next: self.first.as_ref(),
+        }
+    }
+
+    /// Iterate through the blocklist, and apply a function at each step. This
+    /// allows mutating the list as it is traversed, and replaces IterMut, which
+    /// cannot be used due to the links between blocks.
+    ///
+    /// Note that any changes to any block's "next" will be followed at the next
+    /// iteration.
+    pub fn apply<C, R, F: FnMut(&mut FreeBlock, C) -> ApplyState<C, R>>(
+        &mut self,
+        start: C,
+        mut pred: F,
+    ) -> Option<R> {
+        let mut next = self.first.as_mut();
+
+        let mut state = start;
+        while let Some(block) = next.take() {
+            state = match pred(block, state) {
+                ApplyState::Continue(c) => c,
+                ApplyState::Finished(r) => return Some(r),
+                ApplyState::Fail => return None,
+            };
+            next = block.next_mut()
+        }
+
+        None
+    }
+
     /// Check current size of the list, and whether its valid.
     pub fn stats(&self) -> (Validity, Stats) {
-        let mut previous = match self.first {
-            None => {
-                // No blocks, no stats
-                return Default::default();
-            }
-            Some(p) => p,
-        };
-
         let mut validity: Validity = Default::default();
+        let mut stats: Stats = Default::default();
 
-        let mut stats = Stats {
-            length: 1,
-            size: previous.size(),
-        };
-
-        while let Some(next) = previous.next() {
-            match previous.relation(&next) {
-                Relation::Before => {
+        let mut previous: Option<&FreeBlock> = None;
+        for next in self.iter() {
+            match previous.map(|p| p.relation(&next)) {
+                Some(Relation::Before) => {
                     // This is valid, do nothing.
                 }
-                Relation::AdjacentBefore => {
+                Some(Relation::AdjacentBefore) => {
                     // Right order, but these should be merged.
                     validity.adjacents += 1;
                 }
-                Relation::Overlapping => {
+                Some(Relation::Overlapping) => {
                     // This is really bad.
                     validity.overlaps += 1;
                 }
-                Relation::AdjacentAfter => {
+                Some(Relation::AdjacentAfter) => {
                     // Wrong order, and these should be merged.
                     validity.out_of_orders += 1;
                     validity.adjacents += 1;
                 }
-                Relation::After => {
+                Some(Relation::After) => {
                     // Wrong order.
                     validity.out_of_orders += 1;
+                }
+                None => {
+                    // This is the first in the list. Valid, do nothing.
                 }
             }
 
             stats.length += 1;
             stats.size += next.size();
-            previous = next;
+            previous = Some(next);
         }
 
         (validity, stats)
@@ -481,14 +584,15 @@ impl BlockList {
     pub fn pop_size(&mut self, size: usize) -> Option<NonNull<u8>> {
         // debug!("pop_size({})", size);
 
-        let mut first = self.first?;
+        let first_size = self.first.as_ref()?.size();
         // debug!("  pop_size got first");
-        if first.size() == size {
+        if first_size == size {
             // debug!("  First block at {:?} is big enough", first.header);
-            self.first = first.next();
+            let mut first = self.first.take()?;
+            self.first = first.take_next();
             return Some(first.header.cast());
-        } else if first.size() >= size + HEADER_SIZE {
-            let split = first.split(size);
+        } else if first_size >= size + HEADER_SIZE {
+            let split = self.first.as_mut()?.split(size);
             // debug!(
             //     "  Split off from first block at {:?} to {:?}",
             //     first.header, split,
@@ -496,27 +600,30 @@ impl BlockList {
             return Some(split);
         }
 
-        let mut parent = first;
-        loop {
-            let mut next = parent.next()?;
+        self.apply((), |previous, ()| {
+            let next_size: usize = match previous.next() {
+                None => return ApplyState::Fail,
+                Some(next) => next.size(),
+            };
             // log::trace!("  Checking block at {:?} Size {}", next.header, next.size());
 
-            if next.size() == size {
-                let (ptr, _) = parent.pop_next();
+            if next_size == size {
+                // This block is just right - let's pop it out of the chain and return it
+                let ptr = previous.pop_next().unwrap().header.cast();
+                return ApplyState::Finished(ptr);
                 // log::trace!("  Found correctly sized block at {:?}", ptr);
-                return ptr;
             }
 
-            if next.size() < size + HEADER_SIZE {
-                // This block is too small, skip it
-                parent = parent.next().unwrap();
-                continue;
+            if next_size < size + HEADER_SIZE {
+                // This block is too small to be split, skip it
+                return ApplyState::Continue(());
             }
 
             // This block is bigger than we need, split it
             // log::trace!("  Found big block at {:?}", next.header);
-            return Some(next.split(size));
-        }
+            let ptr = previous.next_mut().unwrap().split(size);
+            ApplyState::Finished(ptr)
+        })
     }
 
     /// Add a block to the linked list. Takes ownership of ptr.
@@ -529,29 +636,29 @@ impl BlockList {
     pub unsafe fn add_block(&mut self, ptr: NonNull<u8>, size: usize) {
         let mut new_block = FreeBlock::from_raw(ptr, None, size);
 
-        let mut previous = match self.first {
+        let first: &FreeBlock = match self.first {
             None => {
                 // There are no blocks in this list, so we make this the head of
                 // the list and return
                 self.first = Some(new_block);
                 return;
             }
-            Some(p) => p,
+            Some(ref p) => p,
         };
 
         // We keep the list in sorted order, by pointer, to enable merging.
-        match new_block.relation(&previous) {
+        match new_block.relation(first) {
             Relation::Before => {
                 // This block is well before the first one in the list, so we
                 // add this to the head of the list
-                new_block.header_mut().next = previous.header.as_ptr();
+                new_block.header_mut().next = self.first.take();
                 self.first = Some(new_block);
                 return;
             }
             Relation::AdjacentBefore => {
                 // This block is just before the first block in the list, so we
                 // merge the two into a single block
-                new_block.header_mut().next = previous.header.as_ptr();
+                new_block.header_mut().next = self.first.take();
                 let merged = new_block.try_merge_next();
                 self.first = Some(new_block);
                 assert!(merged, "They were adjacent, they should merge");
@@ -563,15 +670,17 @@ impl BlockList {
             }
             Relation::AdjacentAfter => {
                 // This block is just after the first block in the list, so we
-                // merge the two into a single block. This block isn't part of the list yet,
-                // and 'previous' already correctly points to the next block, so all we need to do
-                // is increase the 'previous' block size.
-                previous.header_mut().size += size;
+                // merge the two into a single block. This block isn't part of
+                // the list yet, and 'previous' already correctly points to the
+                // next block, so all we need to do is increase the 'previous'
+                // block size.
+                let first = self.first.as_mut().unwrap();
+                first.header_mut().size += size;
                 // Now that 'previous' has grown, it's possible that 'previous'
                 // is now adjacent to 'next', so we try and merge them. This may
                 // or may not actually happen, and either way, we're left with a
                 // valid list afterwards.
-                previous.try_merge_next();
+                first.try_merge_next();
                 return;
             }
             _ => {}
@@ -581,7 +690,7 @@ impl BlockList {
         // inserted. Once its place in the list is found, we merge with the
         // previous and/or next if we can, and if not, insert it into
         // the list.
-        loop {
+        self.apply(new_block, |previous, new_block| {
             // By construction, previous < new_block. Now we check previous.next
             // to see if previous < new_block < next, in which case we insert
             // and merge, or if next < new_block, we continue iterating through
@@ -590,37 +699,25 @@ impl BlockList {
                 Some(n) => n,
                 None => {
                     // previous < new_block, and nothing
-                    previous.insert_merge(ptr, size);
-                    return;
+                    previous.insert_merge(new_block);
+                    return ApplyState::Finished(());
                 }
             };
 
             if next.header.cast() < ptr {
                 // next < pointer, so we continue iterating
-                previous = next;
-                continue;
+                return ApplyState::Continue(new_block);
             }
 
             // If we are here, it means previous < ptr < next.
             // Time to insert_merge
-            previous.insert_merge(ptr, size);
-            return;
-        }
+            previous.insert_merge(new_block);
+            ApplyState::Finished(())
+        });
     }
 
     pub fn len(&self) -> usize {
-        let mut parent = match self.first {
-            None => return 0,
-            Some(p) => p,
-        };
-
-        let mut length = 1;
-        while let Some(next) = parent.next() {
-            length += 1;
-            parent = next;
-        }
-
-        length
+        self.iter().count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1002,11 +1099,11 @@ mod tests {
             .as_mut()
             .expect("This should not be null");
         assert_eq!(first.size(), layouts[1].size());
-        let next = first.next();
+        let next_exists = first.next().is_some();
         log::info!("dealloc: {}", allocator.blocks);
         // We should still have the remainder left over from the last page
         // allocation
-        assert!(next.is_some());
+        assert!(next_exists);
 
         // The block list now has 1 64-byte block on it
         log::info!("post-alloc: {}", allocator.blocks);
