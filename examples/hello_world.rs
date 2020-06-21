@@ -1,7 +1,7 @@
-use basicalloc::BasicUnixAlloc;
+use basic_allocator::UnixAllocator;
 
 #[global_allocator]
-static ALLOCATOR: BasicUnixAlloc = BasicUnixAlloc::new();
+static ALLOCATOR: UnixAllocator = UnixAllocator::new();
 
 fn main() {
     env_logger::init();

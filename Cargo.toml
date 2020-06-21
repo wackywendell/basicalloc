@@ -1,5 +1,5 @@
 [package]
-name = "basicalloc"
+name = "basic_allocator"
 version = "0.1.0"
 authors = ["Wendell Smith <wackywendell@gmail.com>"]
 edition = "2018"

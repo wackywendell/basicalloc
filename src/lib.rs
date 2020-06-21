@@ -1,6 +1,57 @@
 #![no_std]
 
-//! A basic memory allocator.
+//! A simple memory allocator, written for educational purposes.
+//!
+//! This module was written primarily for the code to be read. The allocator
+//! enclosed can be used as a memory allocator in a rust program.
+//!
+//! ## Usage
+//!
+//! ```rust
+//! use basic_allocator::UnixAllocator;
+//!
+//! #[global_allocator]
+//! static ALLOCATOR: UnixAllocator = UnixAllocator::new();
+//! fn main() {
+//!     println!("It works!")
+//! }
+//! ```
+//!
+//! See also
+//! [`core::alloc::GlobalAlloc`](https://doc.rust-lang.org/nightly/core/alloc/trait.GlobalAlloc.html).
+//!
+//! ## Major Components
+//!
+//! This module has several parts.
+//!
+//! ### [`BlockList`](struct.BlockList.html)
+//!
+//! A `BlockList` is a linked list of _freed_ memory not returned to the OS,
+//! which can be reused by the allocator.
+//!
+//! The free block starts with a header, and then has unused memory after that.
+//! The header is 16 bytes, and consists of a pointer to the next block and the
+//! size of the block as a whole.
+//!
+//! ### [`RawAlloc`](struct.RawAlloc.html)
+//!
+//! A `RawAlloc` is a single-threaded, non-thread-safe heap and freed memory
+//! manager, implementing
+//! [`core::alloc::GlobalAlloc`](https://doc.rust-lang.org/nightly/core/alloc/trait.GlobalAlloc.html).
+//! However, because it is not thread-safe, it canot be used as a global
+//! allocator.BlockList
+//!
+//! ### [`UnixAllocator`](struct.UnixAllocator.html)
+//!
+//! A `UnixAllocator` wraps `RawAlloc` with a spin lock to make it thread-safe,
+//! allowing it to be used as the global allocator. It also combines `RawAlloc`
+//! with a unix-specific `UnixHeapGrower` to use virtual memory pages as its
+//! underlying basis for making those calls.
+//!
+//! ## Lesser Components
+//!
+//! `HeapGrower` is a simple trait interface meant to abstract over the calls to
+//! the OS to expand the heap.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::fmt;
@@ -12,32 +63,32 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use spin::{Mutex, MutexGuard};
 use static_assertions::const_assert;
 
-// The header for our free blocks.
-//
-// The header includes a pointer to the next free block, and the size of the
-// current block (including the header).
-//
-// We use C representation and align to 16 bytes for... simplicity. This is
-// perhaps a stronger constraint that we need, but it does make things simple
-// and straightforward.
+/// The header for our free blocks.
+///
+/// The header includes a pointer to the next free block, and the size of the
+/// current block (including the header).
+///
+/// We use C representation and align to 16 bytes for... simplicity. This is
+/// perhaps a stronger constraint that we need, but it does make things simple
+/// and straightforward.
 #[derive(Copy, Clone)]
 #[repr(C, align(16))]
-struct FreeHeader {
+pub struct FreeHeader {
     next: *mut FreeHeader,
     size: usize,
 }
 
-// We will align to 16 bytes and our headers will be given that much space
-// Similarly, all blocks will be at least 16 bytes large, even if they aren't
-// aware of it.
-//
-// This is likely a stronger constraint than is entirely needed, but it does
-// simplify things.
+/// We will align to 16 bytes and our headers will be given that much space
+/// Similarly, all blocks will be at least 16 bytes large, even if they aren't
+/// aware of it.
+///
+/// This is likely a stronger constraint than is entirely needed, but it does
+/// simplify things.
 const HEADER_SIZE: usize = 16;
 const_assert!(HEADER_SIZE <= core::mem::size_of::<FreeHeader>());
 
-// An enum for easy comparison of blocks and their order
-enum Relation {
+/// An enum for easy comparison of blocks and their order
+pub enum Relation {
     Before,
     AdjacentBefore,
     Overlapping,
@@ -46,49 +97,77 @@ enum Relation {
 }
 
 impl FreeHeader {
+    /// Construct a header from a freed memory block at `ptr`, with a link to
+    /// the next in `next`, and the size of the block in `size`.
+    ///
+    /// # Safety
+    ///
+    /// This is unsafe because its manipulating raw, freed memory.
+    ///
+    /// To use this safely, `ptr` must point to memory of size `size` not in use
+    /// by or accessible by any program logic.
+    ///
+    /// Further safety constraints are enforced by the invariants of `FreeBlock`
+    /// and `BlockList`.
     #[allow(clippy::cast_ptr_alignment)]
-    unsafe fn from_raw(ptr: *mut u8, next: *mut FreeHeader, size: usize) -> *mut FreeHeader {
+    pub unsafe fn from_raw(ptr: *mut u8, next: *mut FreeHeader, size: usize) -> *mut FreeHeader {
         let header = FreeHeader { next, size };
         core::ptr::write(ptr as *mut FreeHeader, header);
         ptr as *mut FreeHeader
     }
 }
 
-// Invariants that should be maintained:
-//
-// - header should never be a null pointer
-// - header.next should be null or point to a valid MemoryBlock
-// - Any safe functions should preserve LinkedLists
+/// A `FreeBlock` is a wrapper around a pointer to a freed block to be maintained
+/// in a [`BlockList`](struct.BlockList.html).
+///
+/// Invariants that should be maintained:
+///
+/// - header should never be a null pointer
+/// - header.next should be null or point to a valid FreeBlock
+/// - Any safe functions should preserve LinkedLists
 #[derive(Copy, Clone)]
 struct FreeBlock {
     header: *mut FreeHeader,
 }
 
 impl FreeBlock {
-    fn from_raw(ptr: *mut u8, next: Option<FreeBlock>, size: usize) -> FreeBlock {
+    /// Construct a `FreeBlock` from raw parts: a freed memory block at `ptr` of
+    /// size `size`. This will also write the header appropriately.
+    ///
+    /// # Safety
+    ///
+    /// This is unsafe because its manipulating raw, freed memory.
+    ///
+    /// To use this safely, `ptr` must point to memory of size `size` not in use
+    /// by or accessible by any program logic.
+    ///
+    /// Further safety constraints are enforced by the invariants of `BlockList`.
+    pub unsafe fn from_raw(ptr: *mut u8, next: Option<FreeBlock>, size: usize) -> FreeBlock {
         if size < HEADER_SIZE {
             panic!("Can't recapture a block smaller than HEADER_SIZE");
         }
         let next_ptr = next.map(|b| b.header).unwrap_or(null_mut());
-        let header = unsafe { FreeHeader::from_raw(ptr, next_ptr, size) };
+        let header = FreeHeader::from_raw(ptr, next_ptr, size);
         FreeBlock { header }
     }
 
     fn _as_slice(&self) -> &[u8] {
         unsafe {
-            let size = self.header.read().size;
+            let size = self.header_view().size;
             core::slice::from_raw_parts(self.header as *const u8, size)
         }
     }
 
-    fn as_range(&self) -> Range<*const u8> {
+    /// Transform this FreeBlock into a pointer range.
+    pub fn as_range(&self) -> Range<*const u8> {
         unsafe {
-            let size = self.header.read().size;
+            let size = self.header_view().size;
             let start = self.header as *const u8;
             start..(start.add(size))
         }
     }
 
+    /// Compare two blocks to see how they are ordered.
     fn relation(&self, other: &Self) -> Relation {
         let self_range = self.as_range();
         let other_range = other.as_range();
@@ -106,6 +185,7 @@ impl FreeBlock {
         }
     }
 
+    /// Get the next block over from this one.
     fn next(&self) -> Option<Self> {
         let next = self.header_view().next;
         if next.is_null() {
@@ -114,11 +194,13 @@ impl FreeBlock {
         Some(FreeBlock { header: next })
     }
 
-    fn size(&self) -> usize {
+    /// The size of the block, in bytes.
+    pub fn size(&self) -> usize {
         self.header_view().size
     }
 
-    fn header_view(&self) -> &FreeHeader {
+    /// An immutable pointer to the header
+    pub fn header_view(&self) -> &FreeHeader {
         unsafe {
             self.header
                 .as_ref()
@@ -126,21 +208,25 @@ impl FreeBlock {
         }
     }
 
-    // Get a mutable view of the header.
-    //
-    // This method is unsafe because it allows modifying the size or pointer of
-    // a free block in safe code, which could lead to corruption.
-    unsafe fn header_mut(&mut self) -> &mut FreeHeader {
+    /// Get a mutable view of the header.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe because it allows modifying the size or pointer of
+    /// a free block in safe code, which could lead to corruption.
+    pub unsafe fn header_mut(&mut self) -> &mut FreeHeader {
         self.header
             .as_mut()
             .expect("FreeBlock pointers should never be null")
     }
 
-    // Remove the block after this one from the linked list, and return
-    // a pointer to that block and its size.
-    //
-    // If next is null, returns a null pointer and size 0.
-    fn pop_next(&mut self) -> (*mut u8, usize) {
+    /// Remove the block after this one from the linked list, and return
+    /// a pointer to that block and its size.
+    ///
+    /// As is required in a linked list, this will set self.next = next.next.
+    ///
+    /// If next is null, returns a null pointer and size 0.
+    pub fn pop_next(&mut self) -> (*mut u8, usize) {
         let header = unsafe { self.header_mut() };
 
         let next = header.next;
@@ -155,12 +241,25 @@ impl FreeBlock {
         (block.header as *mut u8, block.size())
     }
 
-    // Insert a new element, after this one
-    unsafe fn insert(&mut self, ptr: *mut u8, size: usize) {
+    /// Insert a new element, after this one, maintaining linked list invariants.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a pointer to valid, freed memory of size `size`.
+    pub unsafe fn insert(&mut self, ptr: *mut u8, size: usize) {
         let block = FreeBlock::from_raw(ptr, self.next(), size);
         self.header_mut().next = block.header;
     }
 
+    /// Insert a new element, after this one, maintaining linked list invariants
+    /// and merging with either this item and/or the next, depending on
+    /// adjacency.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a pointer to valid, freed memory of size `size`. To
+    /// maintain `BlockList` invariants, `ptr` must also be greater then
+    /// self.header, and less than self.next (or self.next must be null).
     unsafe fn insert_merge(&mut self, ptr: *mut u8, size: usize) -> usize {
         let end = (self.header as *const u8).add(self.size());
 
@@ -175,16 +274,16 @@ impl FreeBlock {
         merges + if try_next.try_merge_next() { 1 } else { 0 }
     }
 
-    // Split off part of this FreeBlock, and return a pointer to the split off
-    // data.
-    //
-    // The returned pointer is to a region of size 'size' that is no longer
-    // considered free.
-    //
-    // Panics if 'size' is greater than this block's size - HEADER_SIZE, as
-    // there is no way to split off a chunk that large while leaving behind a
-    // FreeBlock with an intact header.
-    fn split(&mut self, size: usize) -> *mut u8 {
+    /// Split off part of this FreeBlock, and return a pointer to the split off
+    /// data.
+    ///
+    /// The returned pointer is to a region of size 'size' that is no longer
+    /// considered free.
+    ///
+    /// Panics if 'size' is greater than this block's size - HEADER_SIZE, as
+    /// there is no way to split off a chunk that large while leaving behind a
+    /// FreeBlock with an intact header.
+    pub fn split(&mut self, size: usize) -> *mut u8 {
         if size + HEADER_SIZE > self.header_view().size {
             panic!(
                 "Can't split a block of size {} off of a block of size {} - need {} for header",
@@ -209,12 +308,12 @@ impl FreeBlock {
         }
     }
 
-    // Attempt to merge this block with the next.
-    //
-    // If the next block exaists, is adjacent, and exists directly after this
-    // block, the two will merge and this will return True; otherwise, this will
-    // return False.
-    fn try_merge_next(&mut self) -> bool {
+    /// Attempt to merge this block with the next.
+    ///
+    /// If the next block exaists, is adjacent, and exists directly after this
+    /// block, the two will merge and this will return True; otherwise, this will
+    /// return False.
+    pub fn try_merge_next(&mut self) -> bool {
         let next = match self.next() {
             None => return false,
             Some(block) => block,
@@ -234,14 +333,21 @@ impl FreeBlock {
     }
 }
 
-// A BlockList is a linked list of "free" blocks.
-//
-// It maintains a few invariants:
-//
-// - Each block should link to the next, with the last one linking to null.
-// - Each block should have a pointer < next.
-// - No two blocks should be precisely adjacent (those should be automatically
-//   merged on insertion).
+/// A `BlockList` is a linked list of "free" blocks in memory.
+///
+/// Each block should be considered "owned" by the BlockList when inserted, and
+/// do not hold any sort of payload. They may be split or merged internally.
+///
+/// In this module, thse memory blocks represent freed memory that has not been
+/// returned to the OS, and provide a "pool" of available memory for reuse by
+/// the allocator.
+///
+/// It maintains a few internal invariants:
+///
+/// - Each block should link to the next, with the last one linking to null.
+/// - Each block should have a pointer < next.
+/// - No two blocks should be precisely adjacent (those should be automatically
+///   merged on insertion).
 pub struct BlockList {
     first: Option<FreeBlock>,
 }
@@ -250,8 +356,8 @@ pub struct BlockList {
 // threads, its fine.
 //
 // With some tweaking and atomic pointer swapping, we could make a thread-safe
-// version of BlockList, but that's more trouble than I'm willing to go to right
-// now
+// version of BlockList, but that has not been done here; hence, it implements
+// Send but not Sync.
 unsafe impl Send for FreeBlock {}
 
 impl Default for BlockList {
@@ -280,25 +386,28 @@ impl fmt::Display for BlockList {
     }
 }
 
+/// Validity contains a representation of all invalid states found in a
+/// BlockList.
 #[derive(Default, Debug)]
 pub struct Validity {
-    // Number of blocks overlapping other blocks.
-    //
-    // This likely indicates corruption.
-    //
-    // If there are also out of order blocks, this might undercount.
+    /// Number of blocks overlapping other blocks.
+    ///
+    /// This likely indicates corruption.
+    ///
+    /// If there are also out of order blocks, this might undercount.
     pub overlaps: usize,
 
-    // Number of blocks that are directly adjacent to each other, and not
-    // merged. This shouldn't happen, but isn't totally corrupt.
+    /// Number of blocks that are directly adjacent to each other, and not
+    /// merged. This shouldn't happen, but isn't totally corrupt.
     pub adjacents: usize,
-    // Number of blocks that do not have an address less than their next.
-    //
-    // This shouldn't occur.
+    /// Number of blocks that do not have an address less than their next.
+    ///
+    /// This shouldn't occur.
     pub out_of_orders: usize,
 }
 
 impl Validity {
+    /// Returns a boolean - a simple check if all cases are 0
     pub fn is_valid(&self) -> bool {
         self.overlaps == 0 && self.adjacents == 0 && self.out_of_orders == 0
     }
@@ -317,7 +426,7 @@ pub struct Stats {
 }
 
 impl BlockList {
-    // Check current size of the list, and whether its valid.
+    /// Check current size of the list, and whether its valid.
     pub fn stats(&self) -> (Validity, Stats) {
         let mut previous = match self.first {
             None => {
@@ -366,8 +475,8 @@ impl BlockList {
         (validity, stats)
     }
 
-    // Find and remove a chunk of size 'size' from the linked list
-    fn pop_size(&mut self, size: usize) -> Option<*mut u8> {
+    /// Find and remove a chunk of size 'size' from the linked list
+    pub fn pop_size(&mut self, size: usize) -> Option<*mut u8> {
         // debug!("pop_size({})", size);
 
         let mut first = self.first?;
@@ -409,7 +518,13 @@ impl BlockList {
     }
 
     /// Add a block to the linked list. Takes ownership of ptr.
-    unsafe fn add_block(&mut self, ptr: *mut u8, size: usize) {
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point to valid, reachable memory of at least `size`, and
+    /// ownership of that memory must be transferred to `BlockList` when this
+    /// method is called.
+    pub unsafe fn add_block(&mut self, ptr: *mut u8, size: usize) {
         let mut new_block = FreeBlock::from_raw(ptr, None, size);
 
         let mut previous = match self.first {
@@ -536,8 +651,9 @@ pub trait HeapGrower {
     unsafe fn grow_heap(&mut self, size: usize) -> (*mut u8, usize);
 }
 
+/// UnixHeapGrower uses virtual memory to grow the heap upon request.
 #[derive(Default)]
-struct UnixHeapGrower {
+pub struct UnixHeapGrower {
     // Just for tracking, not really needed
     pages: usize,
     growths: usize,
@@ -582,10 +698,15 @@ impl HeapGrower for UnixHeapGrower {
     }
 }
 
-// A raw allocator, capable of growing the heap, returning pointers to new
-// allocations, and tracking and reusing freed memory.
-//
-// Note: It never returns memory to the heap.
+/// A raw allocator, capable of growing the heap, returning pointers to new
+/// allocations, and tracking and reusing freed memory.
+///
+/// Note: It never returns memory to the OS; that is not implemented.
+///
+/// This roughly corresponds to the
+/// [`AllocRef`](https://doc.rust-lang.org/nightly/core/alloc/trait.AllocRef.html)
+/// trait in Rust nightly, but does not directly implement that trait (although
+/// it probably could... TODO!)
 pub struct RawAlloc<G> {
     pub grower: G,
     pub blocks: BlockList,
@@ -601,6 +722,7 @@ impl<G: HeapGrower + Default> Default for RawAlloc<G> {
 }
 
 impl<G: HeapGrower> RawAlloc<G> {
+    /// Create a new `RawAlloc`
     #[allow(dead_code)]
     pub fn new(grower: G) -> Self {
         RawAlloc {
@@ -609,6 +731,7 @@ impl<G: HeapGrower> RawAlloc<G> {
         }
     }
 
+    /// Get statistics on this allocator, and verify validity of the BlockList
     pub fn stats(&self) -> (Validity, Stats) {
         self.blocks.stats()
     }
@@ -685,8 +808,11 @@ impl<G: HeapGrower> RawAlloc<G> {
     }
 }
 
-// A thread-safe allocator.
-struct BasicAlloc<G> {
+/// A thread-safe allocator, using a spin lock around a RawAlloc.
+///
+/// Thread-safety is required for an allocator to be used as a global allocator,
+/// so that was easy to add with a spin lock.
+pub struct GenericAllocator<G> {
     // Values:
     // - 0: Untouched
     // - 1: Initialization in progress
@@ -695,23 +821,29 @@ struct BasicAlloc<G> {
     raw: MaybeUninit<Mutex<RawAlloc<G>>>,
 }
 
-impl<G: HeapGrower + Default> Default for BasicAlloc<G> {
+impl<G: HeapGrower + Default> Default for GenericAllocator<G> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<G> BasicAlloc<G> {
+impl<G> GenericAllocator<G> {
     pub const fn new() -> Self {
-        BasicAlloc {
+        GenericAllocator {
             init: AtomicU8::new(0),
             raw: MaybeUninit::uninit(),
         }
     }
 }
 
-impl<G: HeapGrower + Default> BasicAlloc<G> {
-    pub fn get_raw(&self) -> MutexGuard<RawAlloc<G>> {
+impl<G: HeapGrower + Default> GenericAllocator<G> {
+    /// Get a reference to the underlying RawAlloc.
+    ///
+    /// # Safety
+    ///
+    /// This is unsafe because it blocks allocation while the mutex guard is in
+    /// place.
+    pub unsafe fn get_raw(&self) -> MutexGuard<RawAlloc<G>> {
         // First, we check
         //
         // The ordering here is SeqCst because that's the safest, if not the
@@ -721,13 +853,12 @@ impl<G: HeapGrower + Default> BasicAlloc<G> {
         // log::info!("state: {}", state);
         if state == 0 {
             // We haven't initialized, so we do that now.
-            let mx: &mut Mutex<RawAlloc<G>> = unsafe {
-                // We cast the raw pointer to be
-                let raw_loc: *const Mutex<RawAlloc<G>> = self.raw.as_ptr();
-                let raw_mut: *mut Mutex<RawAlloc<G>> = raw_loc as *mut Mutex<RawAlloc<G>>;
-                raw_mut.write(Mutex::new(RawAlloc::default()));
-                raw_mut.as_mut().unwrap()
-            };
+
+            // We cast the raw pointer to be
+            let raw_loc: *const Mutex<RawAlloc<G>> = self.raw.as_ptr();
+            let raw_mut: *mut Mutex<RawAlloc<G>> = raw_loc as *mut Mutex<RawAlloc<G>>;
+            raw_mut.write(Mutex::new(RawAlloc::default()));
+            let mx: &mut Mutex<RawAlloc<G>> = raw_mut.as_mut().unwrap();
 
             // Let other threads know that the mutex and raw allocator are now initialized,
             // and they are free to use the mutex to access the raw allocator
@@ -742,25 +873,25 @@ impl<G: HeapGrower + Default> BasicAlloc<G> {
             state = self.init.load(Ordering::SeqCst);
         }
 
-        let ptr = unsafe { self.raw.as_ptr().as_ref().unwrap() };
+        let ptr = self.raw.as_ptr().as_ref().unwrap();
 
         ptr.lock()
     }
 
     pub fn stats(&self) -> (Validity, Stats) {
-        self.get_raw().stats()
+        unsafe { self.get_raw().stats() }
     }
 }
 
 #[derive(Default)]
-pub struct BasicUnixAlloc {
-    alloc: BasicAlloc<UnixHeapGrower>,
+pub struct UnixAllocator {
+    alloc: GenericAllocator<UnixHeapGrower>,
 }
 
-impl BasicUnixAlloc {
+impl UnixAllocator {
     pub const fn new() -> Self {
-        BasicUnixAlloc {
-            alloc: BasicAlloc::new(),
+        UnixAllocator {
+            alloc: GenericAllocator::new(),
         }
     }
 
@@ -769,7 +900,7 @@ impl BasicUnixAlloc {
     }
 }
 
-unsafe impl GlobalAlloc for BasicUnixAlloc {
+unsafe impl GlobalAlloc for UnixAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         self.alloc.get_raw().alloc(layout)
     }
