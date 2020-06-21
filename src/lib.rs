@@ -57,7 +57,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::fmt;
 use core::mem::MaybeUninit;
 use core::ops::Range;
-use core::ptr::null_mut;
+use core::ptr::{null_mut, NonNull};
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use spin::{Mutex, MutexGuard};
@@ -110,10 +110,15 @@ impl FreeHeader {
     /// Further safety constraints are enforced by the invariants of `FreeBlock`
     /// and `BlockList`.
     #[allow(clippy::cast_ptr_alignment)]
-    pub unsafe fn from_raw(ptr: *mut u8, next: *mut FreeHeader, size: usize) -> *mut FreeHeader {
+    pub unsafe fn from_raw(
+        ptr: NonNull<u8>,
+        next: *mut FreeHeader,
+        size: usize,
+    ) -> NonNull<FreeHeader> {
         let header = FreeHeader { next, size };
-        core::ptr::write(ptr as *mut FreeHeader, header);
-        ptr as *mut FreeHeader
+        let raw_ptr: NonNull<FreeHeader> = ptr.cast();
+        core::ptr::write(ptr.as_ptr() as *mut FreeHeader, header);
+        raw_ptr
     }
 }
 
@@ -127,7 +132,7 @@ impl FreeHeader {
 /// - Any safe functions should preserve LinkedLists
 #[derive(Copy, Clone)]
 struct FreeBlock {
-    header: *mut FreeHeader,
+    header: NonNull<FreeHeader>,
 }
 
 impl FreeBlock {
@@ -142,11 +147,11 @@ impl FreeBlock {
     /// by or accessible by any program logic.
     ///
     /// Further safety constraints are enforced by the invariants of `BlockList`.
-    pub unsafe fn from_raw(ptr: *mut u8, next: Option<FreeBlock>, size: usize) -> FreeBlock {
+    pub unsafe fn from_raw(ptr: NonNull<u8>, next: Option<FreeBlock>, size: usize) -> FreeBlock {
         if size < HEADER_SIZE {
             panic!("Can't recapture a block smaller than HEADER_SIZE");
         }
-        let next_ptr = next.map(|b| b.header).unwrap_or(null_mut());
+        let next_ptr = next.map(|b| b.header.as_ptr()).unwrap_or(null_mut());
         let header = FreeHeader::from_raw(ptr, next_ptr, size);
         FreeBlock { header }
     }
@@ -154,7 +159,7 @@ impl FreeBlock {
     fn _as_slice(&self) -> &[u8] {
         unsafe {
             let size = self.header_view().size;
-            core::slice::from_raw_parts(self.header as *const u8, size)
+            core::slice::from_raw_parts(self.header.as_ptr() as *const u8, size)
         }
     }
 
@@ -162,7 +167,7 @@ impl FreeBlock {
     pub fn as_range(&self) -> Range<*const u8> {
         unsafe {
             let size = self.header_view().size;
-            let start = self.header as *const u8;
+            let start = self.header.as_ptr() as *const u8;
             start..(start.add(size))
         }
     }
@@ -191,7 +196,9 @@ impl FreeBlock {
         if next.is_null() {
             return None;
         }
-        Some(FreeBlock { header: next })
+        Some(FreeBlock {
+            header: unsafe { NonNull::new_unchecked(next) },
+        })
     }
 
     /// The size of the block, in bytes.
@@ -201,11 +208,7 @@ impl FreeBlock {
 
     /// An immutable pointer to the header
     pub fn header_view(&self) -> &FreeHeader {
-        unsafe {
-            self.header
-                .as_ref()
-                .expect("FreeBlock pointers should never be null")
-        }
+        unsafe { self.header.as_ref() }
     }
 
     /// Get a mutable view of the header.
@@ -215,9 +218,7 @@ impl FreeBlock {
     /// This method is unsafe because it allows modifying the size or pointer of
     /// a free block in safe code, which could lead to corruption.
     pub unsafe fn header_mut(&mut self) -> &mut FreeHeader {
-        self.header
-            .as_mut()
-            .expect("FreeBlock pointers should never be null")
+        self.header.as_mut()
     }
 
     /// Remove the block after this one from the linked list, and return
@@ -226,19 +227,20 @@ impl FreeBlock {
     /// As is required in a linked list, this will set self.next = next.next.
     ///
     /// If next is null, returns a null pointer and size 0.
-    pub fn pop_next(&mut self) -> (*mut u8, usize) {
+    pub fn pop_next(&mut self) -> (Option<NonNull<u8>>, usize) {
         let header = unsafe { self.header_mut() };
 
-        let next = header.next;
-        if next.is_null() {
-            return (null_mut(), 0);
-        }
+        let next = if header.next.is_null() {
+            return (None, 0);
+        } else {
+            unsafe { NonNull::new_unchecked(header.next) }
+        };
 
         let block = FreeBlock { header: next };
         // Update this block to look to next's next, cutting next out of the chain
         header.next = block.header_view().next;
 
-        (block.header as *mut u8, block.size())
+        (Some(block.header.cast()), block.size())
     }
 
     /// Insert a new element, after this one, maintaining linked list invariants.
@@ -246,9 +248,9 @@ impl FreeBlock {
     /// # Safety
     ///
     /// `ptr` must be a pointer to valid, freed memory of size `size`.
-    pub unsafe fn insert(&mut self, ptr: *mut u8, size: usize) {
+    pub unsafe fn insert(&mut self, ptr: NonNull<u8>, size: usize) {
         let block = FreeBlock::from_raw(ptr, self.next(), size);
-        self.header_mut().next = block.header;
+        self.header_mut().next = block.header.as_ptr();
     }
 
     /// Insert a new element, after this one, maintaining linked list invariants
@@ -260,10 +262,10 @@ impl FreeBlock {
     /// `ptr` must be a pointer to valid, freed memory of size `size`. To
     /// maintain `BlockList` invariants, `ptr` must also be greater then
     /// self.header, and less than self.next (or self.next must be null).
-    unsafe fn insert_merge(&mut self, ptr: *mut u8, size: usize) -> usize {
-        let end = (self.header as *const u8).add(self.size());
+    unsafe fn insert_merge(&mut self, ptr: NonNull<u8>, size: usize) -> usize {
+        let end = (self.header.as_ptr() as *const u8).add(self.size());
 
-        let (merges, mut try_next) = if end == ptr {
+        let (merges, mut try_next) = if end == ptr.as_ptr() {
             self.header_mut().size += size;
             (1, *self)
         } else {
@@ -283,7 +285,7 @@ impl FreeBlock {
     /// Panics if 'size' is greater than this block's size - HEADER_SIZE, as
     /// there is no way to split off a chunk that large while leaving behind a
     /// FreeBlock with an intact header.
-    pub fn split(&mut self, size: usize) -> *mut u8 {
+    pub fn split(&mut self, size: usize) -> NonNull<u8> {
         if size + HEADER_SIZE > self.header_view().size {
             panic!(
                 "Can't split a block of size {} off of a block of size {} - need {} for header",
@@ -297,7 +299,7 @@ impl FreeBlock {
             // let self_size = self.size();
             let header = self.header_mut();
             header.size -= size;
-            (header as *mut FreeHeader as *mut u8).add(header.size)
+            NonNull::new_unchecked((header as *mut FreeHeader as *mut u8).add(header.size))
             // log::trace!(
             //     "Splitting {} bytes off from {:?}:{} to get {:?}",
             //     size,
@@ -318,8 +320,8 @@ impl FreeBlock {
             None => return false,
             Some(block) => block,
         };
-        let end = unsafe { (self.header as *const u8).add(self.size()) };
-        if end != (next.header as *const u8) {
+        let end = self.as_range().end;
+        if end != next.as_range().start {
             return false;
         };
 
@@ -476,7 +478,7 @@ impl BlockList {
     }
 
     /// Find and remove a chunk of size 'size' from the linked list
-    pub fn pop_size(&mut self, size: usize) -> Option<*mut u8> {
+    pub fn pop_size(&mut self, size: usize) -> Option<NonNull<u8>> {
         // debug!("pop_size({})", size);
 
         let mut first = self.first?;
@@ -484,7 +486,7 @@ impl BlockList {
         if first.size() == size {
             // debug!("  First block at {:?} is big enough", first.header);
             self.first = first.next();
-            return Some(first.header as *mut u8);
+            return Some(first.header.cast());
         } else if first.size() >= size + HEADER_SIZE {
             let split = first.split(size);
             // debug!(
@@ -502,7 +504,7 @@ impl BlockList {
             if next.size() == size {
                 let (ptr, _) = parent.pop_next();
                 // log::trace!("  Found correctly sized block at {:?}", ptr);
-                return Some(ptr);
+                return ptr;
             }
 
             if next.size() < size + HEADER_SIZE {
@@ -524,7 +526,7 @@ impl BlockList {
     /// `ptr` must point to valid, reachable memory of at least `size`, and
     /// ownership of that memory must be transferred to `BlockList` when this
     /// method is called.
-    pub unsafe fn add_block(&mut self, ptr: *mut u8, size: usize) {
+    pub unsafe fn add_block(&mut self, ptr: NonNull<u8>, size: usize) {
         let mut new_block = FreeBlock::from_raw(ptr, None, size);
 
         let mut previous = match self.first {
@@ -542,14 +544,14 @@ impl BlockList {
             Relation::Before => {
                 // This block is well before the first one in the list, so we
                 // add this to the head of the list
-                new_block.header_mut().next = previous.header;
+                new_block.header_mut().next = previous.header.as_ptr();
                 self.first = Some(new_block);
                 return;
             }
             Relation::AdjacentBefore => {
                 // This block is just before the first block in the list, so we
                 // merge the two into a single block
-                new_block.header_mut().next = previous.header;
+                new_block.header_mut().next = previous.header.as_ptr();
                 let merged = new_block.try_merge_next();
                 self.first = Some(new_block);
                 assert!(merged, "They were adjacent, they should merge");
@@ -593,7 +595,7 @@ impl BlockList {
                 }
             };
 
-            if (next.header as *const u8) < ptr {
+            if next.header.cast() < ptr {
                 // next < pointer, so we continue iterating
                 previous = next;
                 continue;
@@ -770,7 +772,7 @@ impl<G: HeapGrower> RawAlloc<G> {
 
         if let Some(ptr) = self.blocks.pop_size(needed_size) {
             // log::trace!("Popped off a block of size {} at {:?}", needed_size, ptr);
-            return ptr;
+            return ptr.as_ptr();
         }
 
         let (ptr, size) = self.grower.grow_heap(needed_size);
@@ -781,7 +783,7 @@ impl<G: HeapGrower> RawAlloc<G> {
             return ptr;
         }
 
-        let free_ptr = ptr.add(needed_size);
+        let free_ptr = NonNull::new_unchecked(ptr.add(needed_size));
         if size >= needed_size + HEADER_SIZE {
             // log::trace!("Adding block of size {}", size - needed_size);
             self.blocks.add_block(free_ptr, size - needed_size);
@@ -804,7 +806,7 @@ impl<G: HeapGrower> RawAlloc<G> {
     /// This is very unsafe. See GlobalAlloc for details.
     pub unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
         let size = RawAlloc::<G>::block_size(layout);
-        self.blocks.add_block(ptr, size);
+        self.blocks.add_block(NonNull::new_unchecked(ptr), size);
     }
 }
 
