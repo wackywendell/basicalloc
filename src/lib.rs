@@ -171,6 +171,22 @@ impl FreeBlock {
         }
     }
 
+    /// Consume this block and return the range of memory covered, and the next
+    /// block in the list.
+    #[must_use]
+    pub fn decompose(mut self) -> (Range<NonNull<u8>>, Option<FreeBlock>) {
+        let next = self.take_next();
+        let range = unsafe {
+            let size = self.header_view().size;
+            let start: NonNull<u8> = self.header.cast();
+            let end: NonNull<u8> =
+                NonNull::new_unchecked(self.header.as_ptr().add(size) as *mut u8);
+            start..end
+        };
+
+        (range, next)
+    }
+
     /// Compare two blocks to see how they are ordered.
     fn relation(&self, other: &Self) -> Relation {
         let self_range = self.as_range();
@@ -299,7 +315,7 @@ impl FreeBlock {
     /// Panics if 'size' is greater than this block's size - HEADER_SIZE, as
     /// there is no way to split off a chunk that large while leaving behind a
     /// FreeBlock with an intact header.
-    pub fn split(&mut self, size: usize) -> NonNull<u8> {
+    pub fn split(&mut self, size: usize) -> Range<NonNull<u8>> {
         if size + HEADER_SIZE > self.header_view().size {
             panic!(
                 "Can't split a block of size {} off of a block of size {} - need {} for header",
@@ -310,10 +326,12 @@ impl FreeBlock {
         }
 
         unsafe {
-            // let self_size = self.size();
+            let self_size = self.size();
             let header = self.header_mut();
             header.size -= size;
-            NonNull::new_unchecked((header as *mut FreeHeader as *mut u8).add(header.size))
+            let start =
+                NonNull::new_unchecked((header as *mut FreeHeader as *mut u8).add(header.size));
+            let end = NonNull::new_unchecked((header as *mut FreeHeader as *mut u8).add(self_size));
             // log::trace!(
             //     "Splitting {} bytes off from {:?}:{} to get {:?}",
             //     size,
@@ -321,6 +339,8 @@ impl FreeBlock {
             //     self_size,
             //     ptr,
             // );
+
+            start..end
         }
     }
 
@@ -383,27 +403,6 @@ impl<'list> Iterator for BlockIter<'list> {
         Some(next)
     }
 }
-
-// pub struct BlockIterMut<'list> {
-//     next: Option<&'list mut FreeBlock>,
-// }
-
-// impl<'list> Iterator for BlockIterMut<'list> {
-//     type Item = &'list mut FreeBlock;
-
-//     fn next(&mut self) -> Option<Self::Item> {
-//         self.next.take().map(|node| {
-//             self.next = node.next_mut().map(|node| &mut *node);
-//             node
-//         })
-
-//         // let next = self.next.take()?;
-
-//         // self.next = next.next_mut();
-
-//         // Some(next)
-//     }
-// }
 
 // A BlockList is sendable - as long as the whole "chain" is maintained across
 // threads, its fine.
@@ -582,16 +581,16 @@ impl BlockList {
     }
 
     /// Find and remove a chunk of size 'size' from the linked list
-    pub fn pop_size(&mut self, size: usize) -> Option<NonNull<u8>> {
+    pub fn pop_size(&mut self, size: usize) -> Option<Range<NonNull<u8>>> {
         // debug!("pop_size({})", size);
 
         let first_size = self.first.as_ref()?.size();
         // debug!("  pop_size got first");
         if first_size == size {
             // debug!("  First block at {:?} is big enough", first.header);
-            let mut first = self.first.take()?;
-            self.first = first.take_next();
-            return Some(first.header.cast());
+            let (range, next) = self.first.take()?.decompose();
+            self.first = next;
+            return Some(range);
         } else if first_size >= size + HEADER_SIZE {
             let split = self.first.as_mut()?.split(size);
             // debug!(
@@ -610,8 +609,10 @@ impl BlockList {
 
             if next_size == size {
                 // This block is just right - let's pop it out of the chain and return it
-                let ptr = previous.pop_next().unwrap().header.cast();
-                return ApplyState::Finished(ptr);
+                let block = previous.pop_next().unwrap();
+                let (range, next) = block.decompose();
+                assert!(next.is_none());
+                return ApplyState::Finished(range);
                 // log::trace!("  Found correctly sized block at {:?}", ptr);
             }
 
@@ -868,9 +869,9 @@ impl<G: HeapGrower> RawAlloc<G> {
         let needed_size = RawAlloc::<G>::block_size(layout);
         // log::trace!("Allocating {} bytes", needed_size);
 
-        if let Some(ptr) = self.blocks.pop_size(needed_size) {
+        if let Some(range) = self.blocks.pop_size(needed_size) {
             // log::trace!("Popped off a block of size {} at {:?}", needed_size, ptr);
-            return ptr.as_ptr();
+            return range.start.as_ptr();
         }
 
         let (ptr, size) = self.grower.grow_heap(needed_size);
