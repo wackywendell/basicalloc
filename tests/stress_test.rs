@@ -1,7 +1,7 @@
 use core::alloc::Layout;
 use core::ptr::null_mut;
 
-use basic_allocator::{RawAlloc, ToyHeap};
+use basic_allocator::allocators::{RawAlloc, ToyHeap};
 
 use rand::distributions::Distribution;
 use rand::seq::SliceRandom;

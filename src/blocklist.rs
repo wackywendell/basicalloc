@@ -1,4 +1,41 @@
 //! A linked list of memory blocks
+//!
+//! This module provides two main abstractions:
+//! [`Blocklist`](struct.BlockList.html), a linked list of memory blocks, and
+//! [`FreeBlock`](struct.FreeBlock.html), a memory block in that list.
+//!
+//! ## [`FreeBlock`](struct.FreeBlock.html)
+//!
+//! The basic unit in this module is the [`FreeBlock`](struct.FreeBlock.html). A
+//! `FreeBlock` is a safe wrapper around a pointer to a memory block "owned" by
+//! that `FreeBlock`, in the sense that the `FreeBlock` should have exclusive
+//! read-write privileges for that memory block. These memory blocks could be
+//! managed by a memory allocator, e.g. sections of a static array or boxed
+//! arrays (see e.g. [`ToyHeap`](`../allocators/struct.ToyHeap.html`)), or as is
+//! the case in this package, free memory on the heap.
+//!
+//! ### Internals
+//!
+//! Each `FreeBlock` consists of a non-null pointer to a section of memory. That
+//! memory starts with a [`FreeHeader`](struct.FreeHeader.html), which consists
+//! of an `Option<FreeBlock>` (e.g., a nullable pointer to the next memory
+//! block) and a `size` denoting the size of the current block.
+//!
+//! `FreeBlock` does not implement `Copy` or `Clone`, because it should be the
+//! exclusive pointer to a block of memory. Safe methods returning a `FreeBlock`
+//! are marked with `#[must_use]`, as dropping a `FreeBlock` leaks memory.
+//!
+//! ## [`Blocklist`](struct.BlockList.html)
+//!
+//! A [`Blocklist`](struct.BlockList.html) is a linked list of memory blocks,
+//! called [`FreeBlock`](struct.FreeBlock.html)s. The ownership model is that
+//! the `BlockList` owns the first [`FreeBlock`](struct.FreeBlock.html), and
+//! each [`FreeBlock`](struct.FreeBlock.html) owns the next.
+//!
+//! As a consequence, `IterMut` cannot be safely implemented on `BlockList`, as
+//! the list does not own the blocks directly, but indirectly, and changes to
+//! one block can affect the structure of the list. Instead, a general-purpose
+//! `apply` function is implemented.
 
 use core::fmt;
 use core::ops::Range;
@@ -16,7 +53,11 @@ use static_assertions::const_assert;
 /// and straightforward.
 #[repr(C, align(16))]
 pub struct FreeHeader {
+    // A link to the next memory block. Note that `Option<FreeBlock>` is an
+    // abstraction around a simple pointer.
     next: Option<FreeBlock>,
+    // The size of the current block, header included. Should never be less than
+    // `HEADER_SIZE`.
     size: usize,
 }
 
