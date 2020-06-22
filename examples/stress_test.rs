@@ -51,11 +51,12 @@ fn main() {
     let mut objects = RandomObjects::default();
 
     for _ in 0..ALLOCATIONS {
-        let mut allocate = true;
-
-        if objects.allocated.len() >= MIN_ALLOCATIONS {
-            allocate = rng.gen();
-        }
+        // Decide if we should allocate a new object, or destroy an old one.
+        let allocate = if objects.allocated.len() >= MIN_ALLOCATIONS {
+            rng.gen()
+        } else {
+            true
+        };
 
         if allocate {
             objects.create(&mut rng);
