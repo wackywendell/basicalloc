@@ -24,6 +24,8 @@
 //! `FreeBlock` does not implement `Copy` or `Clone`, because it should be the
 //! exclusive pointer to a block of memory. Safe methods returning a `FreeBlock`
 //! are marked with `#[must_use]`, as dropping a `FreeBlock` leaks memory.
+//! `FreeBlock` implements `Drop` with a `debug_assert!(false)`, as it should
+//! never be simply dropped; internally, we use `mem::forget` when necessary.
 //!
 //! ## [`Blocklist`](struct.BlockList.html)
 //!

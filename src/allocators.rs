@@ -1,3 +1,32 @@
+//! Basic allocator types, both generic and Unix-specific.
+//!
+//! ## Basic Types
+//!
+//! ### [`RawAlloc`](struct.RawAlloc.html)
+//!
+//! A `RawAlloc` is a single-threaded, non-thread-safe heap and freed memory
+//! manager, implementing
+//! [`core::alloc::GlobalAlloc`](https://doc.rust-lang.org/nightly/core/alloc/trait.GlobalAlloc.html).
+//! However, because it is not thread-safe, it canot be used as a global
+//! allocator.BlockList
+//!
+//! ### [`UnixAllocator`](struct.UnixAllocator.html)
+//!
+//! A `UnixAllocator` wraps `RawAlloc` with a spin lock to make it thread-safe,
+//! allowing it to be used as the global allocator. It also combines `RawAlloc`
+//! with a unix-specific `UnixHeapGrower` to use virtual memory pages as its
+//! underlying basis for making those calls.
+//!
+//! ### [`HeapGrower`](struct.HeapGrower.html)
+//!
+//! `HeapGrower` is a simple trait interface meant to abstract over the calls to
+//! the OS to expand the heap.
+//!
+//! ### [`ToyHeap`](struct.ToyHeap.html)
+//!
+//! `ToyHeap` is a static array on the stack that can pretend to be a heap, and
+//! implements `HeapGrower` for such a purpose. It is mainly useful for testing.
+
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::MaybeUninit;
 use core::ptr::{null_mut, NonNull};
