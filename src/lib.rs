@@ -467,17 +467,6 @@ impl<'list> IntoIterator for &'list BlockList {
     }
 }
 
-// impl<'list> IntoIterator for &'list mut BlockList {
-//     type Item = &'list mut FreeBlock;
-//     type IntoIter = BlockIterMut<'list>;
-
-//     fn into_iter(self) -> Self::IntoIter {
-//         BlockIterMut {
-//             next: self.first.as_mut(),
-//         }
-//     }
-// }
-
 impl fmt::Display for BlockList {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "BlockList(")?;
