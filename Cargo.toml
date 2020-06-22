@@ -5,6 +5,7 @@ description = "A very simple global allocator written in pure Rust"
 repository = "https://github.com/wackywendell/basicalloc"
 license = "MIT"
 license-file = "LICENSE"
+readme = "README.md"
 authors = ["Wendell Smith <wackywendell@gmail.com>"]
 edition = "2018"
 
