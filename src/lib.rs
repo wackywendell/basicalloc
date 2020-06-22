@@ -154,14 +154,15 @@ impl FreeBlock {
         FreeBlock { header }
     }
 
-    fn _as_slice(&self) -> &[u8] {
+    /// Get the memory covered by this block as a slice.
+    pub fn as_slice(&self) -> &[u8] {
         unsafe {
             let size = self.header_view().size;
             core::slice::from_raw_parts(self.header.as_ptr() as *const u8, size)
         }
     }
 
-    /// Transform this FreeBlock into a pointer range.
+    /// Get the pointer range covered by this block.
     pub fn as_range(&self) -> Range<*const u8> {
         unsafe {
             let size = self.header_view().size;
