@@ -10,8 +10,8 @@ fn main() {
     let s: String = "abc".to_owned();
     println!("Got a string {}", s);
 
-    let mut v = vec![0, 1, 2, 3];
-    for n in 10..2048 {
+    let mut v = vec![];
+    for n in 0..(1024 * 1024) {
         log::debug!("Pushing {}", n);
         v.push(n);
     }
