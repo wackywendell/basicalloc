@@ -98,7 +98,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use spin::{Mutex, MutexGuard};
 
-mod blocklist;
+pub mod blocklist;
 
 use blocklist::{BlockList, Stats, Validity};
 
@@ -221,14 +221,6 @@ impl<G: HeapGrower> RawAlloc<G> {
             .expect("Whoa, serious memory issues")
             .pad_to_align();
 
-        // log::trace!(
-        //     "Alignment: {}@{} -> {}@{}",
-        //     layout.size(),
-        //     layout.align(),
-        //     aligned_layout.size(),
-        //     aligned_layout.align()
-        // );
-
         aligned_layout.size()
     }
 
@@ -242,32 +234,34 @@ impl<G: HeapGrower> RawAlloc<G> {
     /// This is very unsafe. See GlobalAlloc for details.
     pub unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
         let needed_size = RawAlloc::<G>::block_size(layout);
-        // log::trace!("Allocating {} bytes", needed_size);
 
         if let Some(range) = self.blocks.pop_size(needed_size) {
-            // log::trace!("Popped off a block of size {} at {:?}", needed_size, ptr);
             return range.start.as_ptr();
         }
 
         let (ptr, size) = self.grower.grow_heap(needed_size);
-        // log::trace!("Grew to size {}", needed_size);
 
         if size == needed_size {
-            // log::trace!("    exactly as needed");
             return ptr;
         }
 
         let free_ptr = NonNull::new_unchecked(ptr.add(needed_size));
         if size >= needed_size + BlockList::header_size() {
-            // log::trace!("Adding block of size {}", size - needed_size);
             self.blocks.add_block(free_ptr, size - needed_size);
-        } else if size > needed_size {
+        } else {
             // Uh-oh. We have a bit of extra free memory, but not enough to add
             // a header and call it a new free block. This could happen if our
             // page size was not a multiple of 16. Weird.
             //
-            // Log it and leak it, I guess...
-            log::warn!("Leaking {} bytes at {:?}", size - needed_size, free_ptr);
+            // We have two choices here: we could return null, indicating memory
+            // allocation failure, or we could leak it, and log it if possible.
+            //
+            // Leaking it is relatively safe, and should be uncommon; at most
+            // once per page, and the only memory leaked would be smaller than
+            // `header_size()`, so let's do that. Preferably, we would log it
+            // too, but that would require a logging implementation that does
+            // not rely on `std` or on allocation, which is not easily
+            // available.
         }
 
         ptr
@@ -326,7 +320,6 @@ impl<G: HeapGrower + Default> GenericAllocator<G> {
         // most efficient. This could probably be downgraded, but would require
         // some analysis and understanding to do so.
         let mut state = self.init.compare_and_swap(0, 1, Ordering::SeqCst);
-        // log::info!("state: {}", state);
         if state == 0 {
             // We haven't initialized, so we do that now.
 
@@ -343,7 +336,6 @@ impl<G: HeapGrower + Default> GenericAllocator<G> {
         }
 
         while state == 1 {
-            // log::info!("Spinning!");
             // Spin while we wait for the state to become 2
             core::sync::atomic::spin_loop_hint();
             state = self.init.load(Ordering::SeqCst);

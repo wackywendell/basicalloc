@@ -14,15 +14,17 @@ edition = "2018"
 libc = "0.2"
 # sysconf tells us the size of a page
 sysconf = "0.3"
-# log is used for logging. This mostly doesn't work inside the allocator because
-# of recursion, but can be useful in tests.
-log = "0.4"
 # Static assertions check that our assumptions are valid at compile-time
 static_assertions = "1.1"
 # A spin lock is used to protect the allocator in a multi-threaded capacity.
 spin = "0.5"
 
 [dev-dependencies]
-env_logger = "0.7"
+# log is used for logging in tests.
+log = "0.4"
+# test-env-log allows `RUST_LOG=...` to output test logs when tests fail.
 test-env-log = "0.2"
+# env_logger is required for test-env-log.
+env_logger = "0.7"
+# We use random numbers to do some stress tests.
 rand = "0.7"

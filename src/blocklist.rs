@@ -1,3 +1,5 @@
+//! A linked list of memory blocks
+
 use core::fmt;
 use core::ops::Range;
 use core::ptr::NonNull;
@@ -25,7 +27,10 @@ pub struct FreeHeader {
 /// This is likely a stronger constraint than is entirely needed, but it does
 /// simplify things.
 const HEADER_SIZE: usize = 16;
-const_assert!(HEADER_SIZE <= core::mem::size_of::<FreeHeader>());
+
+// The constant we use for HEADER_SIZE needs to be bigger than the contents of a
+// header, so we assert that here.
+const_assert!(HEADER_SIZE >= core::mem::size_of::<FreeHeader>());
 
 /// An enum for easy comparison of blocks and their order
 pub enum Relation {
