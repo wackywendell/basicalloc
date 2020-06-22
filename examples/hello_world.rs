@@ -1,5 +1,6 @@
 use basic_allocator::UnixAllocator;
 
+// This is the magic line that creates a new UnixAllocator and uses it globally.
 #[global_allocator]
 static ALLOCATOR: UnixAllocator = UnixAllocator::new();
 

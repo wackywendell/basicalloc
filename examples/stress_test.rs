@@ -7,7 +7,7 @@ use basic_allocator::UnixAllocator;
 use rand::distributions::{Distribution, Uniform};
 use rand::{Rng, RngCore, SeedableRng};
 
-// This is the magic line that creates a new UnixAllocator and uses it.
+// This is the magic line that creates a new UnixAllocator and uses it globally.
 #[global_allocator]
 static ALLOCATOR: UnixAllocator = UnixAllocator::new();
 
