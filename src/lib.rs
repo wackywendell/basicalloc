@@ -48,10 +48,48 @@
 //! with a unix-specific `UnixHeapGrower` to use virtual memory pages as its
 //! underlying basis for making those calls.
 //!
-//! ## Lesser Components
+//! ### [`HeapGrower`](struct.HeapGrower.html)
 //!
 //! `HeapGrower` is a simple trait interface meant to abstract over the calls to
 //! the OS to expand the heap.
+//!
+//! ## Implementation
+//!
+//! Free memory is maintained in a linked list. The allocator has a pointer to
+//! the first block, and each block starts with a header with a pointer to the
+//! next block and the size of the current block. Blocks are in-order, so that
+//! merges are easily implemented.
+//!
+//! ### Allocation
+//!
+//! When [`RawAlloc`](struct.RawAlloc.html) is
+//! [called](struct.RawAlloc.html#method.alloc) to allocate `size` bytes:
+//!
+//! 1. The [`BlockList`](struct.BlockList.html) is iterated through, and if any
+//!    free block is found there large enough for the request, it is used. If
+//!    the found block is just the right size, "popped" out of the linked list,
+//!    and returned as a block of free memory; otherwise, the last `size` bytes
+//!    of the block is returned as free memory, and the block's header is
+//!    adjusted as needed.
+//! 2. If no suitable block is found in the list, the appropriate
+//!    [`HeapGrower`](struct.HeapGrower.html) instance is
+//!    [called](trait.HeapGrower.html#tymethod.grow_heap) to "grow the heap".
+//!    For the [`UnixHeapGrower`](struct.UnixHeapGrower.html), this means that
+//!    one or more pages of virtual memory are requested from the OS. The first
+//!    `size` bytes are returned, and the remainder of the page is added to the
+//!    [`BlockList`](struct.BlockList.html).
+//!
+//! ### Deallocation
+//!
+//! When [`RawAlloc`](struct.RawAlloc.html) is
+//! [called](struct.RawAlloc.html#method.dealloc) to deallocate `size` bytes at
+//! a pointer `ptr`:
+//!
+//! 1. The [`BlockList`](struct.BlockList.html) is iterated through to find
+//!    where in the list `ptr` should be to remain sorted.
+//! 2. `ptr` is inserted, and an attempt is made to merge with both the
+//!    preceding and following blocks. Each attempt is successful only if the
+//!    two blocks involved are adjacent.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::fmt;
