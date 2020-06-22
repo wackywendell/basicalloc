@@ -68,7 +68,7 @@ impl HeapGrower for UnixHeapGrower {
         );
 
         if ptr.is_null() {
-            // panic!("No memory allocated!");
+            // No memory was allocated. Guess we're out of memory...
             return (ptr as *mut u8, 0);
         }
 
@@ -91,6 +91,15 @@ impl HeapGrower for UnixHeapGrower {
 pub struct RawAlloc<G> {
     pub grower: G,
     pub blocks: BlockList,
+}
+
+impl<G> Drop for RawAlloc<G> {
+    fn drop(&mut self) {
+        let blocks = core::mem::take(&mut self.blocks);
+        // When we drop an allocator, we lose all access to the memory it has
+        // freed.
+        core::mem::forget(blocks);
+    }
 }
 
 impl<G: HeapGrower + Default> Default for RawAlloc<G> {
@@ -167,6 +176,12 @@ impl<G: HeapGrower> RawAlloc<G> {
             // too, but that would require a logging implementation that does
             // not rely on `std` or on allocation, which is not easily
             // available.
+            //
+            // This is not generally expected, so we add a debug_assert here.
+            debug_assert!(
+                false,
+                "Unexpected memory left over. Is page_size a multiple of header size?"
+            );
         }
 
         ptr
