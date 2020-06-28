@@ -9,9 +9,14 @@ readme = "README.md"
 authors = ["Wendell Smith <wackywendell@gmail.com>"]
 edition = "2018"
 
+[features]
+default = []
+
+use_libc = ["libc"]
+
 [dependencies]
 # libc is used to get pages of virtual memory from the Unix OS
-libc = "0.2"
+libc = {version = "0.2", optional = true }
 # sysconf tells us the size of a page
 sysconf = "0.3"
 # Static assertions check that our assumptions are valid at compile-time

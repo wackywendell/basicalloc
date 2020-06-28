@@ -1,4 +1,5 @@
 #![no_std]
+#![feature(asm)]
 
 //! A simple memory allocator, written for educational purposes.
 //!
@@ -109,6 +110,7 @@
 
 pub mod allocators;
 pub mod blocklist;
+mod unix;
 
 pub use allocators::{RawAlloc, UnixAllocator};
 pub use blocklist::BlockList;

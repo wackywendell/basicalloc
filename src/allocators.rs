@@ -62,20 +62,23 @@ pub trait HeapGrower {
 }
 
 /// UnixHeapGrower uses virtual memory to grow the heap upon request.
+#[cfg(feature = "use_libc")]
 #[derive(Default)]
-pub struct UnixHeapGrower {
+pub struct LibcHeapGrower {
     // Just for tracking, not really needed
     pages: usize,
     growths: usize,
 }
 
-impl HeapGrower for UnixHeapGrower {
+#[cfg(feature = "use_libc")]
+impl HeapGrower for LibcHeapGrower {
     unsafe fn grow_heap(&mut self, size: usize) -> (*mut u8, usize) {
         if size == 0 {
             return (null_mut(), 0);
         }
         let pagesize = sysconf::page::pagesize();
         let to_allocate = round_up(size, pagesize);
+
         let ptr = libc::mmap(
             // Address we want the memory at. We don't care, so null it is.
             null_mut(),
@@ -90,6 +93,54 @@ impl HeapGrower for UnixHeapGrower {
             //
             // Well, I'm pretty unsure about these choices, but they seem to work...
             libc::MAP_ANON | libc::MAP_PRIVATE,
+            // The file descriptor we want memory mapped. We don't want a memory
+            // mapped file, so 0 it is.
+            0,
+            0,
+        );
+
+        if ptr.is_null() {
+            // No memory was allocated. Guess we're out of memory...
+            return (ptr as *mut u8, 0);
+        }
+
+        self.pages += to_allocate / pagesize;
+        self.growths += 1;
+
+        (ptr as *mut u8, to_allocate)
+    }
+}
+
+/// SyscallHeapGrower uses virtual memory to grow the heap upon request.
+#[derive(Default)]
+pub struct SyscallHeapGrower {
+    // Just for tracking, not really needed
+    pages: usize,
+    growths: usize,
+}
+
+impl HeapGrower for SyscallHeapGrower {
+    unsafe fn grow_heap(&mut self, size: usize) -> (*mut u8, usize) {
+        if size == 0 {
+            return (null_mut(), 0);
+        }
+        let pagesize = sysconf::page::pagesize();
+        let to_allocate = round_up(size, pagesize);
+
+        let ptr = crate::unix::mmap(
+            // Address we want the memory at. We don't care, so null it is.
+            null_mut(),
+            // Amount of memory to allocate
+            to_allocate,
+            // We want read/write access to this memory
+            crate::unix::PROT_WRITE | crate::unix::PROT_READ,
+            // MAP_ANON: We don't want a file descriptor, we're just going to
+            //   use the memory.
+            //
+            // MAP_PRIVATE: We're not sharing this with any other process.
+            //
+            // Well, I'm pretty unsure about these choices, but they seem to work...
+            crate::unix::MAP_ANON | crate::unix::MAP_PRIVATE,
             // The file descriptor we want memory mapped. We don't want a memory
             // mapped file, so 0 it is.
             0,
@@ -302,7 +353,11 @@ impl<G: HeapGrower + Default> GenericAllocator<G> {
 
 #[derive(Default)]
 pub struct UnixAllocator {
-    alloc: GenericAllocator<UnixHeapGrower>,
+    #[cfg(not(feature = "use_libc"))]
+    alloc: GenericAllocator<SyscallHeapGrower>,
+
+    #[cfg(feature = "use_libc")]
+    alloc: GenericAllocator<LibcHeapGrower>,
 }
 
 impl UnixAllocator {
