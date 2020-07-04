@@ -59,13 +59,13 @@ pub unsafe fn mmap(
     offset: i64,
 ) -> Result<*mut u8, MmapError> {
     let addr = addr as i64;
-    let mut in_out: i64 = SYS_MMAP;
+    let out_addr: i64;
 
     asm!(
         r"
         syscall
     ",
-    inout("eax") in_out,
+    inout("eax") SYS_MMAP => out_addr,
     in("edi") addr,
     in("esi") len,
     in("edx") prot,
@@ -74,11 +74,11 @@ pub unsafe fn mmap(
     in("r9d") offset,
     );
 
-    if in_out < 0 {
-        return Err(MmapError { code: (-in_out) });
+    if out_addr < 0 {
+        return Err(MmapError { code: (-out_addr) });
     }
 
-    Ok(in_out as *mut u8)
+    Ok(out_addr as *mut u8)
 }
 
 #[cfg(target_os = "macos")]
@@ -91,8 +91,8 @@ pub unsafe fn mmap(
     offset: i64,
 ) -> Result<*mut u8, MmapError> {
     let addr = addr as i64;
-    let mut in_out: i64 = SYS_MMAP;
-    let mut prot = prot;
+    let out_addr: i64;
+    let err: i64;
 
     asm!(
         r"
@@ -104,20 +104,20 @@ err:
         mov edx, 1
 fin:
     ",
-    inout("eax") in_out,
+    inout("eax") SYS_MMAP => out_addr,
     in("edi") addr,
     in("esi") len,
-    inout("edx") prot,
+    inout("edx") prot => err,
     in("r10d") flags,
     in("r8d") fd,
     in("r9d") offset,
     );
 
-    if prot != 0 {
-        return Err(MmapError { code: in_out });
+    if err != 0 {
+        return Err(MmapError { code: out_addr });
     }
 
-    Ok(in_out as *mut u8)
+    Ok(out_addr as *mut u8)
 }
 
 #[cfg(test)]
