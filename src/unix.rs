@@ -44,6 +44,12 @@ pub const MAP_ANON: u64 = 0x20;
 
 const _MAP_ANONYMOUS: u64 = MAP_ANON;
 
+#[derive(Debug)]
+pub struct MmapError {
+    code: i64,
+}
+
+#[cfg(target_os = "linux")]
 pub unsafe fn mmap(
     addr: *mut u8,
     len: usize,
@@ -51,7 +57,7 @@ pub unsafe fn mmap(
     flags: u64,
     fd: u64,
     offset: i64,
-) -> *mut u8 {
+) -> Result<*mut u8, MmapError> {
     let addr = addr as i64;
     let mut in_out: i64 = SYS_MMAP;
 
@@ -68,6 +74,99 @@ pub unsafe fn mmap(
     in("r9d") offset,
     );
 
-    // TODO error checking!
-    in_out as *mut u8
+    if in_out < 0 {
+        return Err(MmapError { code: (-in_out) });
+    }
+
+    Ok(in_out as *mut u8)
+}
+
+#[cfg(target_os = "macos")]
+pub unsafe fn mmap(
+    addr: *mut u8,
+    len: usize,
+    prot: u64,
+    flags: u64,
+    fd: u64,
+    offset: i64,
+) -> Result<*mut u8, MmapError> {
+    let addr = addr as i64;
+    let mut in_out: i64 = SYS_MMAP;
+    let mut prot = prot;
+
+    asm!(
+        r"
+        syscall
+        jc err
+        mov edx, 0
+        jmp fin
+err:
+        mov edx, 1
+fin:
+    ",
+    inout("eax") in_out,
+    in("edi") addr,
+    in("esi") len,
+    inout("edx") prot,
+    in("r10d") flags,
+    in("r8d") fd,
+    in("r9d") offset,
+    );
+
+    if prot != 0 {
+        return Err(MmapError { code: in_out });
+    }
+
+    Ok(in_out as *mut u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use test_env_log::test;
+
+    #[test]
+    fn test_mmap() {
+        let ptr = unsafe {
+            mmap(
+                // Address
+                core::ptr::null_mut(),
+                // Amount of memory to allocate
+                8,
+                // We want read/write access to this memory
+                PROT_WRITE | PROT_READ,
+                // Mapping flags; MAP_ANON says fd should not be 0
+                MAP_ANON | MAP_PRIVATE,
+                // The file descriptor we want memory mapped. We don't want a memory
+                // mapped file, so 0 it is.
+                0,
+                0,
+            )
+        };
+
+        assert!(ptr.is_ok(), "Error: {:?}", ptr.unwrap_err());
+    }
+
+    #[test]
+    fn test_mmap_err() {
+        let ptr = unsafe {
+            mmap(
+                // Address
+                core::ptr::null_mut(),
+                // Amount of memory to allocate
+                8,
+                // We want read/write access to this memory
+                PROT_WRITE | PROT_READ,
+                // Mapping flags; we use 0 for now
+                0,
+                // The file descriptor we want memory mapped. Without MAP_ANON, this should be set.
+                // This should be an error.
+                0,
+                0,
+            )
+        };
+
+        assert!(ptr.is_err());
+    }
 }

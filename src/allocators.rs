@@ -32,9 +32,12 @@ use core::mem::MaybeUninit;
 use core::ptr::{null_mut, NonNull};
 use core::sync::atomic::{AtomicU8, Ordering};
 
+#[cfg(feature = "use_libc")]
+use errno::Errno;
 use spin::{Mutex, MutexGuard};
 
 use crate::blocklist::{BlockList, Stats, Validity};
+use crate::unix::{self, mmap, MmapError};
 
 // Round up value to the nearest multiple of increment
 fn round_up(value: usize, increment: usize) -> usize {
@@ -45,6 +48,7 @@ fn round_up(value: usize, increment: usize) -> usize {
 }
 
 pub trait HeapGrower {
+    type Err;
     /// Grow the heap by at least size. Returns a pointer and the size of the
     /// memory available at that pointer.
     ///
@@ -58,7 +62,7 @@ pub trait HeapGrower {
     /// - The return value may be (ptr, new_size), where new_size >= size, and
     ///   where the memory pointed to by ptr must be available and untracked by
     ///   any other rust code, including the allocator itself.
-    unsafe fn grow_heap(&mut self, size: usize) -> (*mut u8, usize);
+    unsafe fn grow_heap(&mut self, size: usize) -> Result<(*mut u8, usize), Self::Err>;
 }
 
 /// UnixHeapGrower uses virtual memory to grow the heap upon request.
@@ -72,9 +76,11 @@ pub struct LibcHeapGrower {
 
 #[cfg(feature = "use_libc")]
 impl HeapGrower for LibcHeapGrower {
-    unsafe fn grow_heap(&mut self, size: usize) -> (*mut u8, usize) {
+    type Err = Errno;
+    unsafe fn grow_heap(&mut self, size: usize) -> Result<(*mut u8, usize), Self::Err> {
         if size == 0 {
-            return (null_mut(), 0);
+            // TODO this should maybe return a valid pointer?
+            return Ok((null_mut(), 0));
         }
         let pagesize = sysconf::page::pagesize();
         let to_allocate = round_up(size, pagesize);
@@ -99,15 +105,21 @@ impl HeapGrower for LibcHeapGrower {
             0,
         );
 
+        if (ptr as i64) == -1 {
+            // Error!
+            return Err(errno::errno());
+        }
+
         if ptr.is_null() {
             // No memory was allocated. Guess we're out of memory...
-            return (ptr as *mut u8, 0);
+            // XXX: Is this possible?
+            return Ok((ptr as *mut u8, 0));
         }
 
         self.pages += to_allocate / pagesize;
         self.growths += 1;
 
-        (ptr as *mut u8, to_allocate)
+        Ok((ptr as *mut u8, to_allocate))
     }
 }
 
@@ -120,42 +132,47 @@ pub struct SyscallHeapGrower {
 }
 
 impl HeapGrower for SyscallHeapGrower {
-    unsafe fn grow_heap(&mut self, size: usize) -> (*mut u8, usize) {
+    type Err = MmapError;
+
+    unsafe fn grow_heap(&mut self, size: usize) -> Result<(*mut u8, usize), MmapError> {
         if size == 0 {
-            return (null_mut(), 0);
+            // TODO: I think this should _not_ be a null pointer?
+            return Ok((null_mut(), 0));
         }
-        let pagesize = sysconf::page::pagesize();
+
+        // Page size is 4 kb "on most architectures"
+        let pagesize = 4096;
         let to_allocate = round_up(size, pagesize);
 
-        let ptr = crate::unix::mmap(
+        let ptr = mmap(
             // Address we want the memory at. We don't care, so null it is.
             null_mut(),
             // Amount of memory to allocate
             to_allocate,
             // We want read/write access to this memory
-            crate::unix::PROT_WRITE | crate::unix::PROT_READ,
+            unix::PROT_WRITE | unix::PROT_READ,
             // MAP_ANON: We don't want a file descriptor, we're just going to
             //   use the memory.
             //
             // MAP_PRIVATE: We're not sharing this with any other process.
             //
             // Well, I'm pretty unsure about these choices, but they seem to work...
-            crate::unix::MAP_ANON | crate::unix::MAP_PRIVATE,
+            unix::MAP_ANON | unix::MAP_PRIVATE,
             // The file descriptor we want memory mapped. We don't want a memory
             // mapped file, so 0 it is.
             0,
             0,
-        );
+        )?;
 
         if ptr.is_null() {
-            // No memory was allocated. Guess we're out of memory...
-            return (ptr as *mut u8, 0);
+            // I'm not sure when this would happen...
+            return Ok((ptr as *mut u8, 0));
         }
 
         self.pages += to_allocate / pagesize;
         self.growths += 1;
 
-        (ptr as *mut u8, to_allocate)
+        Ok((ptr as *mut u8, to_allocate))
     }
 }
 
@@ -233,7 +250,12 @@ impl<G: HeapGrower> RawAlloc<G> {
             return range.start.as_ptr();
         }
 
-        let (ptr, size) = self.grower.grow_heap(needed_size);
+        let growth = self.grower.grow_heap(needed_size);
+
+        let (ptr, size) = match growth {
+            Err(_) => return null_mut(),
+            Ok(res) => res,
+        };
 
         if size == needed_size {
             return ptr;
@@ -398,16 +420,20 @@ impl Default for ToyHeap {
     }
 }
 
+pub struct ToyHeapOverflowError();
+
 impl HeapGrower for ToyHeap {
-    unsafe fn grow_heap(&mut self, size: usize) -> (*mut u8, usize) {
+    type Err = ToyHeapOverflowError;
+
+    unsafe fn grow_heap(&mut self, size: usize) -> Result<(*mut u8, usize), Self::Err> {
         if self.size + size > self.heap.len() {
-            return (null_mut(), 0);
+            return Err(ToyHeapOverflowError());
         }
 
         let allocating = round_up(size, self.page_size);
         let ptr = self.heap.as_mut_ptr().add(self.size);
         self.size += allocating;
-        (ptr, allocating)
+        Ok((ptr, allocating))
     }
 }
 

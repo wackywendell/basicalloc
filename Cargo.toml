@@ -12,13 +12,15 @@ edition = "2018"
 [features]
 default = []
 
-use_libc = ["libc"]
+use_libc = ["libc", "sysconf", "errno"]
 
 [dependencies]
 # libc is used to get pages of virtual memory from the Unix OS
 libc = {version = "0.2", optional = true }
 # sysconf tells us the size of a page
-sysconf = "0.3"
+sysconf = {version = "0.3", optional = true }
+# errno tells us what the error is
+errno = {version = "0.2", optional = true }
 # Static assertions check that our assumptions are valid at compile-time
 static_assertions = "1.1"
 # A spin lock is used to protect the allocator in a multi-threaded capacity.
