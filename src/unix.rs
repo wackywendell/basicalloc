@@ -1,3 +1,4 @@
+#![cfg(not(feature = "use_libc"))]
 /// Some unix constants and an mmap function using assembly.
 ///
 /// The constants were taken from sys/mman.h, and have been tested on osx and
@@ -49,7 +50,7 @@ pub struct MmapError {
     code: i64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(not(feature = "use_libc"), target_os = "linux"))]
 pub unsafe fn mmap(
     addr: *mut u8,
     len: usize,
@@ -81,7 +82,7 @@ pub unsafe fn mmap(
     Ok(out_addr as *mut u8)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(not(feature = "use_libc"), target_os = "macos"))]
 pub unsafe fn mmap(
     addr: *mut u8,
     len: usize,

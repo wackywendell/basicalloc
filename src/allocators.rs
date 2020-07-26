@@ -37,6 +37,7 @@ use errno::Errno;
 use spin::{Mutex, MutexGuard};
 
 use crate::blocklist::{BlockList, Stats, Validity};
+#[cfg(not(feature = "use_libc"))]
 use crate::unix::{self, mmap, MmapError};
 
 // Round up value to the nearest multiple of increment
@@ -124,6 +125,7 @@ impl HeapGrower for LibcHeapGrower {
 }
 
 /// SyscallHeapGrower uses virtual memory to grow the heap upon request.
+#[cfg(not(feature = "use_libc"))]
 #[derive(Default)]
 pub struct SyscallHeapGrower {
     // Just for tracking, not really needed
@@ -131,6 +133,7 @@ pub struct SyscallHeapGrower {
     growths: usize,
 }
 
+#[cfg(not(feature = "use_libc"))]
 impl HeapGrower for SyscallHeapGrower {
     type Err = MmapError;
 
