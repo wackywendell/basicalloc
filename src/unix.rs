@@ -97,13 +97,19 @@ pub unsafe fn mmap(
 
     asm!(
         r"
+        // Make a syscall, using the parameters in the registers
         syscall
-        jc err
+        // osx sets the carry bit if there's an error. If that happens, we jump
+        // to label 1
+        jc 1f
+        // Set edx to 0 to indicate no error
         mov edx, 0
-        jmp fin
-err:
+        // Jump to label 2 to finish this
+        jmp 2f
+1:
+        // There was an error. Set edx to 1 to indicate that.
         mov edx, 1
-fin:
+2:
     ",
     inout("eax") SYS_MMAP => out_addr,
     in("edi") addr,
