@@ -39,7 +39,7 @@
 //! one block can affect the structure of the list. Instead, a general-purpose
 //! `apply` function is implemented.
 
-use core::fmt;
+use core::fmt::{self, Display};
 use core::ops::Range;
 use core::ptr::NonNull;
 
@@ -489,6 +489,16 @@ impl From<Validity> for bool {
 pub struct Stats {
     pub length: usize,
     pub size: usize,
+}
+
+impl Display for Stats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        write!(
+            f,
+            "{} empty blocks in allocator, total size {} bytes",
+            self.length, self.size
+        )
+    }
 }
 
 /// State after a single "apply".

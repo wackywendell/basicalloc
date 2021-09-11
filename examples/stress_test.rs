@@ -14,13 +14,20 @@ static ALLOCATOR: UnixAllocator = UnixAllocator::new();
 // Minimum number of allocations before we start deallocating
 const MIN_ALLOCATIONS: usize = 1024;
 // Total number of allocations / deallocations
-const ALLOCATIONS: usize = 64 * 1024;
+const STEPS: usize = 64 * 1024;
 // Log_2 of the maximum sized array to allocate
 const LOG2_MAX_SIZE: usize = 20;
 
+const USAGE: &str = "[STEPS] [MIN_ALLOCATIONS] [LOG2_MAX_SIZE]
+
+In a short loop, this will allocate and deallocate a total of STEPS times, with deallocations
+occurring only if at least MIN_ALLOCATIONS have occurred.
+
+Allocations will be between 1 and 2^LOG2_MAX_SIZE-1 bytes (inclusive), approximately logarithmically spaced.";
+
 #[derive(Default)]
 struct RandomObjects {
-    allocated: Vec<Vec<u64>>,
+    allocated: Vec<Vec<u8>>,
     log2_max_size: usize,
 }
 
@@ -34,10 +41,29 @@ impl RandomObjects {
         }
     }
 
+    // Generate a random size to allocate between 1 and 2^self.
+    fn rand_size<R: Rng>(&self, rng: &mut R) -> usize {
+        // Generate a power of 2 up to half the max
+        let n1 = 1usize << (rng.gen_range(0usize..self.log2_max_size));
+        // Generate a second number to add to it, up to doubling it, to make it not a power of 2
+        let n2 = rng.gen_range(0..n1);
+        let new_size = n1 + n2;
+
+        let expected_max: usize = ((1 << (self.log2_max_size - 1)) - 1) * 2 + 1;
+        assert!(new_size < expected_max);
+        // println!(
+        //     "Size: {} + {} = {} / 2^{} ({})",
+        //     n1, n2, new_size, self.log2_max_size, expected_max,
+        // );
+
+        new_size
+    }
+
     fn create<R: Rng>(&mut self, rng: &mut R) {
-        let range = Uniform::new_inclusive(8usize, self.log2_max_size);
-        let new_size = (range.sample(rng) * range.sample(rng)) as u64;
-        let obj: Vec<u64> = (0..new_size).collect();
+        let new_size = self.rand_size(rng);
+
+        // Allocate as many bytes as expected
+        let obj: Vec<u8> = Vec::with_capacity(new_size);
         self.allocated.push(obj);
     }
 
@@ -56,31 +82,36 @@ impl RandomObjects {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.contains(&"--help".to_owned()) {
-        println!(
-            "USAGE: {} [ALLOCATIONS] [MIN_ALLOCATIONS] [LOG2_MAX_SIZE]",
-            args[0]
-        );
+        println!("USAGE: {} {}", args[0], USAGE);
         return;
     }
-    let mut allocations: usize = args
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(ALLOCATIONS);
+    let mut steps: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(STEPS);
     let min_allocations: usize = args
         .get(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(MIN_ALLOCATIONS);
-    if allocations < min_allocations {
-        allocations = min_allocations;
+    if steps < min_allocations {
+        steps = min_allocations;
     }
-    let log2_max_size: usize = args
+    let log2_max_size_arg: usize = args
         .get(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(LOG2_MAX_SIZE);
 
+    let log2_max_size = if log2_max_size_arg <= usize::BITS as usize {
+        log2_max_size_arg
+    } else {
+        println!(
+            "Allocation size of 2^{} bytes too large, using 2^{}",
+            log2_max_size_arg,
+            usize::BITS,
+        );
+        usize::BITS as usize
+    };
+
     env_logger::init();
     println!("Running Stress Test.\n\nParameters:");
-    println!("    {} total allocations", allocations);
+    println!("    {} total allocation steps", steps);
     println!(
         "    {} allocations before any deallocations",
         min_allocations
@@ -95,39 +126,51 @@ fn main() {
 
     let mut allocation_run: isize = min_allocations as isize;
 
-    for i in 1..=allocations {
+    for i in 1..=steps {
         // Decide if we should allocate some new objects, or destroy an old one.
-        while allocation_run == 0 {
-            let mut max_allocations = objects.allocated.len();
-            if max_allocations < min_allocations {
-                max_allocations = min_allocations;
+        match allocation_run.cmp(&0) {
+            std::cmp::Ordering::Equal => {
+                let mut max_allocations = objects.allocated.len();
+                if max_allocations < min_allocations {
+                    max_allocations = min_allocations;
+                }
+                let max_deallocations = objects.allocated.len() as isize;
+                let range = Uniform::new(-(max_deallocations as isize), max_allocations as isize);
+                while allocation_run == 0 {
+                    allocation_run = range.sample(&mut rng);
+                    // println!("Running {} allocations", allocation_run);
+                }
             }
-            let max_deallocations = objects.allocated.len() as isize;
-            let range = Uniform::new(-(max_deallocations as isize), max_allocations as isize);
-            allocation_run = range.sample(&mut rng);
-            // println!("Running {} allocations", allocation_run);
-        }
-
-        if allocation_run > 0 {
-            objects.create(&mut rng);
-            allocation_run -= 1;
-        } else {
-            objects.destroy(&mut rng);
-            allocation_run += 1;
+            std::cmp::Ordering::Greater => {
+                objects.create(&mut rng);
+                allocation_run -= 1;
+            }
+            std::cmp::Ordering::Less => {
+                objects.destroy(&mut rng);
+                allocation_run += 1;
+            }
         }
 
         let (validity, stats) = ALLOCATOR.stats();
         if i % 1024 == 0 {
-            println!("Step {} / {}", i, allocations);
+            println!("Step {} / {}", i, steps);
             let count = objects.allocated.len();
             let total_size: usize = objects.allocated.iter().map(|v| v.len()).sum();
             println!("    Allocated objects: {}, size: {}", count, total_size);
-            println!("    Allocator stats: {:?}", stats);
-            println!("    Allocations in progress: {}", allocation_run);
+            println!("    Allocator stats: {}", stats);
+            if allocation_run >= 0 {
+                println!("    Allocations in progress: {}", allocation_run);
+            } else {
+                println!("    Deallocations in progress: {}", -allocation_run);
+            }
         }
         assert!(validity.is_valid());
     }
 
+    println!(
+        "Finished allocating, deallocating {} objects",
+        objects.allocated.len(),
+    );
     while !objects.allocated.is_empty() {
         objects.destroy(&mut rng);
         let (validity, _) = ALLOCATOR.stats();
@@ -136,6 +179,6 @@ fn main() {
 
     let (validity, stats) = ALLOCATOR.stats();
     println!("\nFinished.");
-    println!("    Stats:    {:?}", stats);
+    println!("    Stats: {}", stats);
     assert!(validity.is_valid());
 }
