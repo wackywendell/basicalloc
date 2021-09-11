@@ -545,7 +545,7 @@ impl BlockList {
 
         let mut previous: Option<&FreeBlock> = None;
         for next in self.iter() {
-            match previous.map(|p| p.relation(&next)) {
+            match previous.map(|p| p.relation(next)) {
                 Some(Relation::Before) => {
                     // This is valid, do nothing.
                 }

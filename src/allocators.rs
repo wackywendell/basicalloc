@@ -339,31 +339,58 @@ impl<G: HeapGrower + Default> GenericAllocator<G> {
     /// This is unsafe because it blocks allocation while the mutex guard is in
     /// place.
     pub unsafe fn get_raw(&self) -> MutexGuard<RawAlloc<G>> {
-        // First, we check
+        // The plan:
+        // - Check if initialization hasn't started (0)
+        // - If initializing hasn't yet started (0):
+        //   - Mark it as initializing (1), then initialize, then mark it as fully initialized (2)
+        // - If it has started but not completed (1):
+        //   - Enter a spin loop until it is fully initiialized (2)
+        // - If it finished initializing (2):
+        //   - Continue
         //
         // The ordering here is SeqCst because that's the safest, if not the
         // most efficient. This could probably be downgraded, but would require
         // some analysis and understanding to do so.
-        let mut state = self.init.compare_and_swap(0, 1, Ordering::SeqCst);
-        if state == 0 {
-            // We haven't initialized, so we do that now.
+        let state = self
+            .init
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
 
-            // We cast the raw pointer to be
-            let raw_loc: *const Mutex<RawAlloc<G>> = self.raw.as_ptr();
-            let raw_mut: *mut Mutex<RawAlloc<G>> = raw_loc as *mut Mutex<RawAlloc<G>>;
-            raw_mut.write(Mutex::new(RawAlloc::default()));
-            let mx: &mut Mutex<RawAlloc<G>> = raw_mut.as_mut().unwrap();
+        match state {
+            Err(2) => {
+                // This is fully initialized, no need to do anything
+            }
+            Ok(0) => {
+                // We haven't initialized, so we do that now.
 
-            // Let other threads know that the mutex and raw allocator are now initialized,
-            // and they are free to use the mutex to access the raw allocator
-            self.init.store(2, Ordering::SeqCst);
-            return mx.lock();
-        }
+                // We cast the raw pointer to be
+                let raw_loc: *const Mutex<RawAlloc<G>> = self.raw.as_ptr();
+                let raw_mut: *mut Mutex<RawAlloc<G>> = raw_loc as *mut Mutex<RawAlloc<G>>;
+                raw_mut.write(Mutex::new(RawAlloc::default()));
+                let mx: &mut Mutex<RawAlloc<G>> = raw_mut.as_mut().unwrap();
 
-        while state == 1 {
-            // Spin while we wait for the state to become 2
-            core::sync::atomic::spin_loop_hint();
-            state = self.init.load(Ordering::SeqCst);
+                // Let other threads know that the mutex and raw allocator are now initialized,
+                // and they are free to use the mutex to access the raw allocator
+                self.init.store(2, Ordering::SeqCst);
+                return mx.lock();
+            }
+            Err(1) => {
+                // Some other thread is currently initializing. We wait for it.
+
+                // Spin while we wait for the state to become 2
+                loop {
+                    // Hint to the processor that we're in a spin loop
+                    core::hint::spin_loop();
+
+                    // Check if the
+                    match self.init.load(Ordering::SeqCst) {
+                        1 => continue,
+                        2 => break,
+                        state => panic!("Unexpected state {}", state),
+                    }
+                }
+            }
+            Ok(v) => panic!("Unexpected OK state loaded: {}", v),
+            Err(v) => panic!("Unexpected Err state loaded: {}", v),
         }
 
         let ptr = self.raw.as_ptr().as_ref().unwrap();
