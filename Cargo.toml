@@ -1,13 +1,13 @@
 [package]
-name = "basic_allocator"
-version = "0.1.6"
-description = "A very simple global allocator written in pure Rust"
-repository = "https://github.com/wackywendell/basicalloc"
-documentation = "https://docs.rs/basic_allocator"
-license-file = "LICENSE"
-readme = "README.md"
 authors = ["Wendell Smith <wackywendell@gmail.com>"]
+description = "A very simple global allocator written in pure Rust"
+documentation = "https://docs.rs/basic_allocator"
 edition = "2018"
+license-file = "LICENSE"
+name = "basic_allocator"
+readme = "README.md"
+repository = "https://github.com/wackywendell/basicalloc"
+version = "0.1.6"
 
 [features]
 default = []
@@ -16,15 +16,15 @@ use_libc = ["libc", "sysconf", "errno"]
 
 [dependencies]
 # libc is used to get pages of virtual memory from the Unix OS
-libc = {version = "0.2", optional = true }
+libc = {version = "0.2", optional = true}
 # sysconf tells us the size of a page
-sysconf = {version = "0.3", optional = true }
+sysconf = {version = "0.3", optional = true}
 # errno tells us what errors libc produced
-errno = {version = "0.2", optional = true }
+errno = {version = "0.2", optional = true}
 # Static assertions check that our assumptions are valid at compile-time
 static_assertions = "1.1"
 # A spin lock is used to protect the allocator in a multi-threaded capacity.
-spin = "0.5"
+spin = "0.9.2"
 
 [dev-dependencies]
 # log is used for logging in tests.
@@ -32,6 +32,6 @@ log = "0.4"
 # test-env-log allows `RUST_LOG=...` to output test logs when tests fail.
 test-env-log = "0.2"
 # env_logger is required for test-env-log.
-env_logger = "0.7"
+env_logger = "0.9.0"
 # We use random numbers to do some stress tests.
-rand = "0.7"
+rand = "0.8.4"
