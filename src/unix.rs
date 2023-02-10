@@ -3,7 +3,7 @@
 ///
 /// The constants were taken from sys/mman.h, and have been tested on osx and
 /// linux.
-
+use core::arch::asm;
 //============================================================
 // System call code
 #[cfg(target_os = "macos")]
