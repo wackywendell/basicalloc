@@ -50,6 +50,12 @@ pub struct MmapError {
     code: i64,
 }
 
+impl MmapError {
+    pub fn code(&self) -> i64 {
+        self.code
+    }
+}
+
 #[cfg(all(not(feature = "use_libc"), target_os = "linux"))]
 pub unsafe fn mmap(
     addr: *mut u8,
