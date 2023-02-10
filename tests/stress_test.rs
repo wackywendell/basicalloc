@@ -6,7 +6,7 @@ use basic_allocator::allocators::{RawAlloc, ToyHeap};
 use rand::distributions::Distribution;
 use rand::seq::SliceRandom;
 use rand::{RngCore, SeedableRng};
-use test_env_log::test;
+use test_log::test;
 
 #[test]
 fn test_stress() {
