@@ -3,7 +3,7 @@
 ///
 /// The constants were taken from sys/mman.h, and have been tested on osx and
 /// linux.
-
+use core::arch::asm;
 //============================================================
 // System call code
 #[cfg(target_os = "macos")]
@@ -48,6 +48,12 @@ const _MAP_ANONYMOUS: u64 = MAP_ANON;
 #[derive(Debug)]
 pub struct MmapError {
     code: i64,
+}
+
+impl MmapError {
+    pub fn code(&self) -> i64 {
+        self.code
+    }
 }
 
 #[cfg(all(not(feature = "use_libc"), target_os = "linux"))]
@@ -131,7 +137,7 @@ pub unsafe fn mmap(
 mod tests {
     use super::*;
 
-    use test_env_log::test;
+    use test_log::test;
 
     #[test]
     fn test_mmap() {

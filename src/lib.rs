@@ -1,5 +1,4 @@
 #![no_std]
-#![cfg_attr(not(feature = "use_libc"), feature(asm))]
 
 //! A simple memory allocator, written for educational purposes.
 //!
