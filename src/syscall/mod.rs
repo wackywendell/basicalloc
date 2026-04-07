@@ -87,7 +87,10 @@ impl MmapError {
 pub fn page_size() -> usize {
     #[cfg(feature = "use_libc")]
     {
-        sysconf::page::pagesize()
+        // SAFETY: _SC_PAGESIZE is always valid and returns a positive value.
+        // We use ::libc to refer to the external crate, since this module
+        // also has a `libc` submodule.
+        unsafe { ::libc::sysconf(::libc::_SC_PAGESIZE) as usize }
     }
     #[cfg(not(feature = "use_libc"))]
     {
