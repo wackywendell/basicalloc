@@ -34,6 +34,22 @@ examples-libc:
     cargo run --features use_libc --example grow_heap
     cargo run --features use_libc --release --example stress_test -- 4096 512 16
 
+# Check formatting
+fmt:
+    cargo fmt --check
+
+# Run clippy on both feature sets
+clippy:
+    cargo clippy --all-targets -- -D warnings
+    cargo clippy --all-targets --features use_libc -- -D warnings
+
+# Build docs, deny warnings
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+
+# All lint checks: fmt, clippy, docs
+lint: fmt clippy doc
+
 # Run everything locally: both feature sets, tests + examples
 test-all: test test-libc examples examples-libc
 
@@ -56,5 +72,5 @@ docker-examples: docker-build
     {{ docker-run }} basicalloc-ci cargo run --features use_libc --example hello_world
     {{ docker-run }} basicalloc-ci cargo run --features use_libc --example grow_heap
 
-# Full CI-style check: local + docker, both feature sets
-ci: test-all docker-test docker-examples
+# Full CI-style check: lint + tests + docker
+ci: lint test-all docker-test docker-examples
