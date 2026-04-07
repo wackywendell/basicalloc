@@ -1,44 +1,38 @@
-//! Basic allocator types, both generic and Unix-specific.
+//! Allocator types, both generic and platform-specific.
 //!
-//! ## Basic Types
+//! ## Types
 //!
 //! ### [`RawAlloc`](struct.RawAlloc.html)
 //!
 //! A `RawAlloc` is a single-threaded, non-thread-safe heap and freed memory
 //! manager, implementing
 //! [`core::alloc::GlobalAlloc`](https://doc.rust-lang.org/nightly/core/alloc/trait.GlobalAlloc.html).
-//! However, because it is not thread-safe, it canot be used as a global
-//! allocator.BlockList
+//! However, because it is not thread-safe, it cannot be used as a global
+//! allocator.
 //!
 //! ### [`UnixAllocator`](struct.UnixAllocator.html)
 //!
 //! A `UnixAllocator` wraps `RawAlloc` with a spin lock to make it thread-safe,
-//! allowing it to be used as the global allocator. It also combines `RawAlloc`
-//! with a unix-specific `UnixHeapGrower` to use virtual memory pages as its
-//! underlying basis for making those calls.
+//! allowing it to be used as the global allocator. It combines `RawAlloc`
+//! with [`MmapHeapGrower`](struct.MmapHeapGrower.html) to use virtual memory
+//! pages as its underlying source of memory.
 //!
-//! ### [`HeapGrower`](struct.HeapGrower.html)
+//! ### [`HeapGrower`](trait.HeapGrower.html)
 //!
-//! `HeapGrower` is a simple trait interface meant to abstract over the calls to
-//! the OS to expand the heap.
-//!
-//! ### [`ToyHeap`](struct.ToyHeap.html)
-//!
-//! `ToyHeap` is a static array on the stack that can pretend to be a heap, and
-//! implements `HeapGrower` for such a purpose. It is mainly useful for testing.
+//! `HeapGrower` is a trait that abstracts over calls to the OS to expand the
+//! heap. [`MmapHeapGrower`](struct.MmapHeapGrower.html) is the real
+//! implementation (using mmap); [`ToyHeap`](struct.ToyHeap.html) is a
+//! stack-based fake used for testing.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::MaybeUninit;
 use core::ptr::{null_mut, NonNull};
 use core::sync::atomic::{AtomicU8, Ordering};
 
-#[cfg(feature = "use_libc")]
-use errno::Errno;
 use spin::{Mutex, MutexGuard};
 
 use crate::blocklist::{BlockList, Stats, Validity};
-#[cfg(not(feature = "use_libc"))]
-use crate::unix::{self, mmap, MmapError};
+use crate::syscall;
 
 // Round up value to the nearest multiple of increment
 fn round_up(value: usize, increment: usize) -> usize {
@@ -66,116 +60,49 @@ pub trait HeapGrower {
     unsafe fn grow_heap(&mut self, size: usize) -> Result<(*mut u8, usize), Self::Err>;
 }
 
-/// UnixHeapGrower uses virtual memory to grow the heap upon request.
-#[cfg(feature = "use_libc")]
+/// MmapHeapGrower uses virtual memory pages (via mmap) to grow the heap.
+///
+/// It delegates to [`syscall::mmap`], which is backed by either inline assembly
+/// or libc depending on the `use_libc` feature. This struct doesn't need to know
+/// which — the syscall module handles that.
 #[derive(Default)]
-pub struct LibcHeapGrower {
+pub struct MmapHeapGrower {
     // Just for tracking, not really needed
     pages: usize,
     growths: usize,
 }
 
-#[cfg(feature = "use_libc")]
-impl HeapGrower for LibcHeapGrower {
-    type Err = Errno;
+impl HeapGrower for MmapHeapGrower {
+    type Err = syscall::MmapError;
+
     unsafe fn grow_heap(&mut self, size: usize) -> Result<(*mut u8, usize), Self::Err> {
         if size == 0 {
-            // TODO this should maybe return a valid pointer?
-            return Ok((null_mut(), 0));
-        }
-        let pagesize = sysconf::page::pagesize();
-        let to_allocate = round_up(size, pagesize);
-
-        let ptr = libc::mmap(
-            // Address we want the memory at. We don't care, so null it is.
-            null_mut(),
-            // Amount of memory to allocate
-            to_allocate,
-            // We want read/write access to this memory
-            libc::PROT_WRITE | libc::PROT_READ,
-            // MAP_ANON: We don't want a file descriptor, we're just going to
-            //   use the memory.
-            //
-            // MAP_PRIVATE: We're not sharing this with any other process.
-            //
-            // Well, I'm pretty unsure about these choices, but they seem to work...
-            libc::MAP_ANON | libc::MAP_PRIVATE,
-            // The file descriptor we want memory mapped. We don't want a memory
-            // mapped file, so 0 it is.
-            0,
-            0,
-        );
-
-        if (ptr as i64) == -1 {
-            // Error!
-            return Err(errno::errno());
-        }
-
-        if ptr.is_null() {
-            // No memory was allocated. Guess we're out of memory...
-            // XXX: Is this possible?
-            return Ok((ptr as *mut u8, 0));
-        }
-
-        self.pages += to_allocate / pagesize;
-        self.growths += 1;
-
-        Ok((ptr as *mut u8, to_allocate))
-    }
-}
-
-/// SyscallHeapGrower uses virtual memory to grow the heap upon request.
-#[cfg(not(feature = "use_libc"))]
-#[derive(Default)]
-pub struct SyscallHeapGrower {
-    // Just for tracking, not really needed
-    pages: usize,
-    growths: usize,
-}
-
-#[cfg(not(feature = "use_libc"))]
-impl HeapGrower for SyscallHeapGrower {
-    type Err = MmapError;
-
-    unsafe fn grow_heap(&mut self, size: usize) -> Result<(*mut u8, usize), MmapError> {
-        if size == 0 {
-            // TODO: I think this should _not_ be a null pointer?
+            // TODO: should this return a valid pointer instead of null?
             return Ok((null_mut(), 0));
         }
 
-        // Page size is 4 kb "on most architectures"
-        let pagesize = 4096;
+        let pagesize = syscall::page_size();
         let to_allocate = round_up(size, pagesize);
 
-        let ptr = mmap(
-            // Address we want the memory at. We don't care, so null it is.
+        let ptr = syscall::mmap(
+            // Address: null lets the kernel choose
             null_mut(),
-            // Amount of memory to allocate
+            // Amount of memory to allocate (rounded up to whole pages)
             to_allocate,
             // We want read/write access to this memory
-            unix::PROT_WRITE | unix::PROT_READ,
-            // MAP_ANON: We don't want a file descriptor, we're just going to
-            //   use the memory.
-            //
-            // MAP_PRIVATE: We're not sharing this with any other process.
-            //
-            // Well, I'm pretty unsure about these choices, but they seem to work...
-            unix::MAP_ANON | unix::MAP_PRIVATE,
-            // The file descriptor we want memory mapped. We don't want a memory
-            // mapped file, so 0 it is.
+            syscall::consts::PROT_READ | syscall::consts::PROT_WRITE,
+            // MAP_ANON: not backed by a file, just anonymous memory
+            // MAP_PRIVATE: not shared with other processes
+            syscall::consts::MAP_ANON | syscall::consts::MAP_PRIVATE,
+            // fd and offset: unused for anonymous mappings
             0,
             0,
         )?;
 
-        if ptr.is_null() {
-            // I'm not sure when this would happen...
-            return Ok((ptr as *mut u8, 0));
-        }
-
         self.pages += to_allocate / pagesize;
         self.growths += 1;
 
-        Ok((ptr as *mut u8, to_allocate))
+        Ok((ptr, to_allocate))
     }
 }
 
@@ -405,11 +332,7 @@ impl<G: HeapGrower + Default> GenericAllocator<G> {
 
 #[derive(Default)]
 pub struct UnixAllocator {
-    #[cfg(not(feature = "use_libc"))]
-    alloc: GenericAllocator<SyscallHeapGrower>,
-
-    #[cfg(feature = "use_libc")]
-    alloc: GenericAllocator<LibcHeapGrower>,
+    alloc: GenericAllocator<MmapHeapGrower>,
 }
 
 impl UnixAllocator {

@@ -77,17 +77,28 @@ impl MmapError {
 
 /// Returns the OS page size for the current target.
 ///
-/// This is a compile-time constant per architecture + OS combination.
 /// All mmap allocations are rounded up to a multiple of this value,
 /// since the kernel allocates memory in whole pages.
-pub const fn page_size() -> usize {
-    // Apple Silicon uses 16K pages; everything else we support uses 4K.
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+///
+/// When `use_libc` is enabled, this queries the OS at runtime via sysconf,
+/// which is the most robust approach. Without `use_libc`, we use well-known
+/// compile-time constants per architecture + OS (4K for most targets, 16K
+/// for Apple Silicon).
+pub fn page_size() -> usize {
+    #[cfg(feature = "use_libc")]
     {
-        16384
+        sysconf::page::pagesize()
     }
-    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    #[cfg(not(feature = "use_libc"))]
     {
-        4096
+        // Apple Silicon uses 16K pages; everything else we support uses 4K.
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            16384
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+        {
+            4096
+        }
     }
 }

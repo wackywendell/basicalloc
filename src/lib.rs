@@ -38,20 +38,27 @@
 //! A `RawAlloc` is a single-threaded, non-thread-safe heap and freed memory
 //! manager, implementing
 //! [`core::alloc::GlobalAlloc`](https://doc.rust-lang.org/nightly/core/alloc/trait.GlobalAlloc.html).
-//! However, because it is not thread-safe, it canot be used as a global
-//! allocator.BlockList
+//! However, because it is not thread-safe, it cannot be used as a global
+//! allocator.
 //!
 //! ### [`UnixAllocator`](allocators/struct.UnixAllocator.html)
 //!
 //! A `UnixAllocator` wraps `RawAlloc` with a spin lock to make it thread-safe,
-//! allowing it to be used as the global allocator. It also combines `RawAlloc`
-//! with a unix-specific `UnixHeapGrower` to use virtual memory pages as its
-//! underlying basis for making those calls.
+//! allowing it to be used as the global allocator. It combines `RawAlloc`
+//! with [`MmapHeapGrower`](allocators/struct.MmapHeapGrower.html), which uses
+//! the [`syscall`] module to request virtual memory pages from the OS.
 //!
-//! ### [`HeapGrower`](allocators/struct.HeapGrower.html)
+//! ### [`HeapGrower`](allocators/trait.HeapGrower.html)
 //!
 //! `HeapGrower` is a simple trait interface meant to abstract over the calls to
 //! the OS to expand the heap.
+//!
+//! ### [`syscall`](syscall/index.html)
+//!
+//! The `syscall` module provides a platform-independent interface for calling
+//! `mmap`. It supports both inline assembly (on x86_64 and aarch64, Linux and
+//! macOS) and a libc wrapper (via the `use_libc` feature). Both paths expose
+//! the same function signature, so code above this layer needs no cfg gates.
 //!
 //! ## Implementation
 //!
@@ -71,12 +78,13 @@
 //!    and returned as a block of free memory; otherwise, the last `size` bytes
 //!    of the block is returned as free memory, and the block's header is
 //!    adjusted as needed.
-//! 2. If no suitable block is found in the list, the appropriate
-//!    [`HeapGrower`](allocators/struct.HeapGrower.html) instance is
+//! 2. If no suitable block is found in the list, the
+//!    [`HeapGrower`](allocators/trait.HeapGrower.html) instance is
 //!    [called](allocators/trait.HeapGrower.html#tymethod.grow_heap) to "grow the heap".
-//!    For the [`UnixHeapGrower`](allocators/struct.UnixHeapGrower.html), this means that
-//!    one or more pages of virtual memory are requested from the OS. The first
-//!    `size` bytes are returned, and the remainder of the page is added to the
+//!    For [`MmapHeapGrower`](allocators/struct.MmapHeapGrower.html), this means that
+//!    one or more pages of virtual memory are requested from the OS via
+//!    [`syscall::mmap`](syscall/fn.mmap.html). The first `size` bytes are
+//!    returned, and the remainder of the page is added to the
 //!    [`BlockList`](blocklist/struct.BlockList.html).
 //!
 //! ### Deallocation
@@ -109,7 +117,7 @@
 
 pub mod allocators;
 pub mod blocklist;
-mod unix;
+pub mod syscall;
 
 pub use allocators::{RawAlloc, UnixAllocator};
 pub use blocklist::BlockList;

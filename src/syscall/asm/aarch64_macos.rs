@@ -40,10 +40,11 @@ pub unsafe fn mmap(
 
     asm!(
         "svc #0x80",
-        // Read the carry flag from NZCV. Bit 29 is the C (carry) flag.
-        // If carry is set, the syscall failed and x0 contains the errno.
-        "mrs {err}, nzcv",
-        err = out("reg") err,
+        // Use cset to capture the carry flag into a register.
+        // "cs" = carry set, which macOS uses to indicate syscall error.
+        // Sets err to 1 on error, 0 on success.
+        "cset {err:w}, cs",
+        err = out(reg) err,
         in("x16") SYS_MMAP,
         inout("x0") addr as u64 => out_addr,
         in("x1") len,
@@ -53,8 +54,7 @@ pub unsafe fn mmap(
         in("x5") offset,
     );
 
-    // Bit 29 of NZCV is the carry flag
-    if err & (1 << 29) != 0 {
+    if err != 0 {
         return Err(MmapError::from_code(out_addr as i64));
     }
 
