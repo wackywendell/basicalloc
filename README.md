@@ -9,22 +9,26 @@ itself](https://github.com/wackywendell/basicalloc) for more details.
 
 ## Development
 
-Development can happen locally on an OSX or Linux machine, using the standard Rust frameworks. In addition, Docker can be used for emulating linux:
+Development can happen locally on macOS or Linux using standard Rust tooling.
+A [justfile](https://just.systems/) provides common recipes:
 
 ```console
-$ # Develop using the code mounted
-$ docker build --target dev -t basicallocdev . && docker run -v `pwd`:/usr/src/basicalloc -it basicallocdev
-[...]
-root@0123456789ab:/usr/src/basicalloc# cargo test
-[...]
+$ just test          # run tests (default features)
+$ just test-libc     # run tests with use_libc feature
+$ just test-all      # both feature sets, tests + examples
+$ just docker-test   # run tests in Docker (Linux x86_64)
+$ just ci            # full CI: local + docker, both feature sets
+$ just --list        # see all available recipes
 ```
+
+A devcontainer configuration is included for VS Code / GitHub Codespaces.
 
 ## Examples
 
-Several examples live in the `examples` directory. These can be run with cargo:
+Several examples live in the `examples` directory:
 
 ```console
-$ cargo run --example grow_heap
 $ cargo run --example hello_world
+$ cargo run --example grow_heap
 $ cargo run --release --example stress_test
 ```
