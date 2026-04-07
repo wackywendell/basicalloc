@@ -379,11 +379,10 @@ impl HeapGrower for ToyHeap {
     type Err = ToyHeapOverflowError;
 
     unsafe fn grow_heap(&mut self, size: usize) -> Result<(*mut u8, usize), Self::Err> {
-        if self.size + size > self.heap.len() {
+        let allocating = round_up(size, self.page_size);
+        if self.size + allocating > self.heap.len() {
             return Err(ToyHeapOverflowError());
         }
-
-        let allocating = round_up(size, self.page_size);
         let ptr = self.heap.as_mut_ptr().add(self.size);
         self.size += allocating;
         Ok((ptr, allocating))
