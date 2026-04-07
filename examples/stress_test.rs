@@ -130,15 +130,11 @@ fn main() {
         // Decide if we should allocate some new objects, or destroy an old one.
         match allocation_run.cmp(&0) {
             std::cmp::Ordering::Equal => {
-                let mut max_allocations = objects.allocated.len();
-                if max_allocations < min_allocations {
-                    max_allocations = min_allocations;
-                }
+                let max_allocations = objects.allocated.len().max(min_allocations) as isize;
                 let max_deallocations = objects.allocated.len() as isize;
-                let range = Uniform::new(-(max_deallocations as isize), max_allocations as isize);
+                let range = Uniform::new(-max_deallocations, max_allocations);
                 while allocation_run == 0 {
                     allocation_run = range.sample(&mut rng);
-                    // println!("Running {} allocations", allocation_run);
                 }
             }
             std::cmp::Ordering::Greater => {
