@@ -17,6 +17,21 @@
 //! }
 //! ```
 //!
+//! ## Logging
+//!
+//! The allocator emits `log::trace!` messages during allocation and
+//! deallocation (block splitting, merging, etc.). These are zero-cost when
+//! no logger is installed. To see them in tests:
+//!
+//! ```console
+//! $ RUST_LOG=trace cargo test
+//! ```
+//!
+//! Note: setting up a logger in a program that uses this as its global
+//! allocator is tricky — the logger itself may allocate. The trace output
+//! is most useful during testing with `ToyHeap` or when debugging with
+//! an external logger that doesn't allocate.
+//!
 //! See also
 //! [`core::alloc::GlobalAlloc`](https://doc.rust-lang.org/nightly/core/alloc/trait.GlobalAlloc.html).
 //!

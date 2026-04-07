@@ -335,13 +335,14 @@ impl FreeBlock {
             let start =
                 NonNull::new_unchecked((header as *mut FreeHeader as *mut u8).add(header.size));
             let end = NonNull::new_unchecked((header as *mut FreeHeader as *mut u8).add(self_size));
-            // log::trace!(
-            //     "Splitting {} bytes off from {:?}:{} to get {:?}",
-            //     size,
-            //     (header as *mut FreeHeader as *mut u8),
-            //     self_size,
-            //     ptr,
-            // );
+            log::trace!(
+                "Splitting {} bytes off from {:?}:{} to get {:?}..{:?}",
+                size,
+                (header as *mut FreeHeader as *mut u8),
+                self_size,
+                start,
+                end,
+            );
 
             start..end
         }
@@ -349,7 +350,7 @@ impl FreeBlock {
 
     /// Attempt to merge this block with the next.
     ///
-    /// If the next block exaists, is adjacent, and exists directly after this
+    /// If the next block exists, is adjacent, and exists directly after this
     /// block, the two will merge and this will return True; otherwise, this will
     /// return False.
     pub fn try_merge_next(&mut self) -> bool {
@@ -380,7 +381,7 @@ impl FreeBlock {
 /// Each block should be considered "owned" by the BlockList when inserted, and
 /// do not hold any sort of payload. They may be split or merged internally.
 ///
-/// In this module, thse memory blocks represent freed memory that has not been
+/// In this module, these memory blocks represent freed memory that has not been
 /// returned to the OS, and provide a "pool" of available memory for reuse by
 /// the allocator.
 ///
@@ -610,15 +611,19 @@ impl BlockList {
                 None => return ApplyState::Fail(()),
                 Some(next) => next.size(),
             };
-            // log::trace!("  Checking block at {:?} Size {}", next.header, next.size());
+            log::trace!(
+                "  Checking block at {:?} size {}",
+                previous.header,
+                next_size
+            );
 
             if next_size == size {
                 // This block is just right - let's pop it out of the chain and return it
                 let block = previous.pop_next().unwrap();
                 let (range, next) = block.decompose();
                 assert!(next.is_none());
+                log::trace!("  Found correctly sized block at {:?}", range.start);
                 return ApplyState::Finished(range);
-                // log::trace!("  Found correctly sized block at {:?}", ptr);
             }
 
             if next_size < size + HEADER_SIZE {
@@ -627,8 +632,8 @@ impl BlockList {
             }
 
             // This block is bigger than we need, split it
-            // log::trace!("  Found big block at {:?}", next.header);
             let ptr = previous.next_mut().unwrap().split(size);
+            log::trace!("  Found oversized block at {:?}, splitting", ptr);
             ApplyState::Finished(ptr)
         });
 
