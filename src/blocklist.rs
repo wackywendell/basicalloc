@@ -217,13 +217,13 @@ impl FreeBlock {
     /// Remove the next, and return it
     #[must_use]
     fn take_next(&mut self) -> Option<Self> {
-        unsafe { (&mut self.header_mut().next).take() }
+        unsafe { self.header_mut().next.take() }
     }
 
     /// Set this block's next to new_next, and return the old one
     #[must_use]
     fn replace_next(&mut self, new_next: FreeBlock) -> Option<Self> {
-        unsafe { (&mut self.header_mut().next).replace(new_next) }
+        unsafe { self.header_mut().next.replace(new_next) }
     }
 
     /// The size of the block, in bytes.
@@ -391,6 +391,7 @@ impl FreeBlock {
 /// - Each block should have a pointer < next.
 /// - No two blocks should be precisely adjacent (those should be automatically
 ///   merged on insertion).
+#[derive(Default)]
 pub struct BlockList {
     first: Option<FreeBlock>,
 }
@@ -418,12 +419,6 @@ impl<'list> Iterator for BlockIter<'list> {
 // version of BlockList, but that has not been done here; hence, it implements
 // Send but not Sync.
 unsafe impl Send for FreeBlock {}
-
-impl Default for BlockList {
-    fn default() -> Self {
-        BlockList { first: None }
-    }
-}
 
 impl<'list> IntoIterator for &'list BlockList {
     type Item = &'list FreeBlock;

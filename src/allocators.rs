@@ -245,9 +245,7 @@ impl<G: HeapGrower + Default> Default for GenericAllocator<G> {
 
 impl<G> GenericAllocator<G> {
     pub const fn new() -> Self {
-        GenericAllocator {
-            raw: Once::new(),
-        }
+        GenericAllocator { raw: Once::new() }
     }
 }
 
