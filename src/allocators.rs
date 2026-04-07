@@ -25,11 +25,9 @@
 //! stack-based fake used for testing.
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::mem::MaybeUninit;
 use core::ptr::{null_mut, NonNull};
-use core::sync::atomic::{AtomicU8, Ordering};
 
-use spin::{Mutex, MutexGuard};
+use spin::{Mutex, MutexGuard, Once};
 
 use crate::blocklist::{BlockList, Stats, Validity};
 use crate::syscall;
@@ -112,9 +110,8 @@ impl HeapGrower for MmapHeapGrower {
 /// Note: It never returns memory to the OS; that is not implemented.
 ///
 /// This roughly corresponds to the
-/// [`AllocRef`](https://doc.rust-lang.org/nightly/core/alloc/trait.AllocRef.html)
-/// trait in Rust nightly, but does not directly implement that trait (although
-/// it probably could... TODO!)
+/// [`Allocator`](https://doc.rust-lang.org/nightly/core/alloc/trait.Allocator.html)
+/// trait in Rust nightly, but does not directly implement that trait.
 pub struct RawAlloc<G> {
     pub grower: G,
     pub blocks: BlockList,
@@ -233,14 +230,11 @@ impl<G: HeapGrower> RawAlloc<G> {
 /// A thread-safe allocator, using a spin lock around a RawAlloc.
 ///
 /// Thread-safety is required for an allocator to be used as a global allocator,
-/// so that was easy to add with a spin lock.
+/// so that was easy to add with a spin lock. `spin::Once` handles the lazy
+/// initialization — the RawAlloc is created on first use, and other threads
+/// spin-wait if they race the initialization.
 pub struct GenericAllocator<G> {
-    // Values:
-    // - 0: Untouched
-    // - 1: Initialization in progress
-    // - 2: Initialized
-    init: AtomicU8,
-    raw: MaybeUninit<Mutex<RawAlloc<G>>>,
+    raw: Once<Mutex<RawAlloc<G>>>,
 }
 
 impl<G: HeapGrower + Default> Default for GenericAllocator<G> {
@@ -252,81 +246,24 @@ impl<G: HeapGrower + Default> Default for GenericAllocator<G> {
 impl<G> GenericAllocator<G> {
     pub const fn new() -> Self {
         GenericAllocator {
-            init: AtomicU8::new(0),
-            raw: MaybeUninit::uninit(),
+            raw: Once::new(),
         }
     }
 }
 
 impl<G: HeapGrower + Default> GenericAllocator<G> {
-    /// Get a reference to the underlying RawAlloc.
+    /// Get a locked reference to the underlying RawAlloc.
     ///
-    /// # Safety
-    ///
-    /// This is unsafe because it blocks allocation while the mutex guard is in
-    /// place.
-    pub unsafe fn get_raw(&self) -> MutexGuard<'_, RawAlloc<G>> {
-        // The plan:
-        // - Check if initialization hasn't started (0)
-        // - If initializing hasn't yet started (0):
-        //   - Mark it as initializing (1), then initialize, then mark it as fully initialized (2)
-        // - If it has started but not completed (1):
-        //   - Enter a spin loop until it is fully initiialized (2)
-        // - If it finished initializing (2):
-        //   - Continue
-        //
-        // The ordering here is SeqCst because that's the safest, if not the
-        // most efficient. This could probably be downgraded, but would require
-        // some analysis and understanding to do so.
-        let state = self
-            .init
-            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
-
-        match state {
-            Err(2) => {
-                // This is fully initialized, no need to do anything
-            }
-            Ok(0) => {
-                // We haven't initialized, so we do that now.
-
-                // We cast the raw pointer to be
-                let raw_loc: *const Mutex<RawAlloc<G>> = self.raw.as_ptr();
-                let raw_mut: *mut Mutex<RawAlloc<G>> = raw_loc as *mut Mutex<RawAlloc<G>>;
-                raw_mut.write(Mutex::new(RawAlloc::default()));
-                let mx: &mut Mutex<RawAlloc<G>> = raw_mut.as_mut().unwrap();
-
-                // Let other threads know that the mutex and raw allocator are now initialized,
-                // and they are free to use the mutex to access the raw allocator
-                self.init.store(2, Ordering::SeqCst);
-                return mx.lock();
-            }
-            Err(1) => {
-                // Some other thread is currently initializing. We wait for it.
-
-                // Spin while we wait for the state to become 2
-                loop {
-                    // Hint to the processor that we're in a spin loop
-                    core::hint::spin_loop();
-
-                    // Check if the
-                    match self.init.load(Ordering::SeqCst) {
-                        1 => continue,
-                        2 => break,
-                        state => panic!("Unexpected state {}", state),
-                    }
-                }
-            }
-            Ok(v) => panic!("Unexpected OK state loaded: {}", v),
-            Err(v) => panic!("Unexpected Err state loaded: {}", v),
-        }
-
-        let ptr = self.raw.as_ptr().as_ref().unwrap();
-
-        ptr.lock()
+    /// On first call, this initializes the RawAlloc. Subsequent calls just
+    /// acquire the mutex. Allocation is blocked while the guard is held.
+    pub fn get_raw(&self) -> MutexGuard<'_, RawAlloc<G>> {
+        self.raw
+            .call_once(|| Mutex::new(RawAlloc::default()))
+            .lock()
     }
 
     pub fn stats(&self) -> (Validity, Stats) {
-        unsafe { self.get_raw().stats() }
+        self.get_raw().stats()
     }
 }
 
