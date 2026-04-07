@@ -265,7 +265,7 @@ impl<G: HeapGrower + Default> GenericAllocator<G> {
     ///
     /// This is unsafe because it blocks allocation while the mutex guard is in
     /// place.
-    pub unsafe fn get_raw(&self) -> MutexGuard<RawAlloc<G>> {
+    pub unsafe fn get_raw(&self) -> MutexGuard<'_, RawAlloc<G>> {
         // The plan:
         // - Check if initialization hasn't started (0)
         // - If initializing hasn't yet started (0):

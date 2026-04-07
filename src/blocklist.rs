@@ -516,7 +516,7 @@ impl BlockList {
         HEADER_SIZE
     }
 
-    pub fn iter(&self) -> BlockIter {
+    pub fn iter(&self) -> BlockIter<'_> {
         BlockIter {
             next: self.first.as_ref(),
         }
